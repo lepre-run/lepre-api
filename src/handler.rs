@@ -22,7 +22,7 @@ use crate::redirect;
 use crate::strava;
 
 const STRAVA_AUTHORIZE_URL: &str = "https://www.strava.com/oauth/authorize";
-const REDIRECT_URI: &str = "https://api.lepre.dev/v1/auth/strava/callback";
+const REDIRECT_URI: &str = "https://api.lepre.run/v1/auth/strava/callback";
 const REQUIRED_SCOPES: &[&str] = &["read", "activity:read_all", "profile:read_all"];
 
 /// Per-Lambda-container context shared across invocations.
@@ -298,14 +298,14 @@ mod tests {
         let url = build_authorize_url(
             "https://www.strava.com/oauth/authorize",
             "12345",
-            "https://api.lepre.dev/v1/auth/strava/callback",
+            "https://api.lepre.run/v1/auth/strava/callback",
             "abc",
         );
         assert!(url.contains("client_id=12345"));
         assert!(url.contains("response_type=code"));
         assert!(
             url.contains(
-                "redirect_uri=https%3A%2F%2Fapi.lepre.dev%2Fv1%2Fauth%2Fstrava%2Fcallback"
+                "redirect_uri=https%3A%2F%2Fapi.lepre.run%2Fv1%2Fauth%2Fstrava%2Fcallback"
             ),
             "got: {url}"
         );

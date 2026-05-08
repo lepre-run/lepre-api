@@ -1,6 +1,6 @@
 # lepre-api
 
-Single Rust Lambda fronting `api.lepre.dev`. Implements three routes:
+Single Rust Lambda fronting `api.lepre.run`. Implements three routes:
 
 - `GET /v1/healthz`
 - `GET /v1/auth/strava/start`

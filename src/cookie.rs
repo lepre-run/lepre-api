@@ -1,6 +1,6 @@
 //! State-cookie helpers for the OAuth flow (ADR 001 §2).
 //!
-//! The state cookie is host-only on `api.lepre.dev` (no `Domain=` attribute,
+//! The state cookie is host-only on `api.lepre.run` (no `Domain=` attribute,
 //! so it is bound to the exact host and not its subdomains), scoped by
 //! `Path=/v1/auth/strava` so it is not sent on `/v1/healthz` or any other
 //! route.

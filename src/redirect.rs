@@ -8,7 +8,7 @@ use lambda_http::Response;
 use crate::cookie::clear_state_cookie;
 use crate::headers;
 
-const APP_BASE: &str = "https://lepre.dev";
+const APP_BASE: &str = "https://lepre.run";
 
 /// Build a 302 to the given app path (e.g. `/connected` or
 /// `/connect-failed?reason=...`), always sending `Set-Cookie` to clear the
@@ -65,7 +65,7 @@ mod tests {
     fn to_connected_clears_cookie_and_points_at_app() {
         let r = to_connected();
         assert_eq!(r.status(), 302);
-        assert_eq!(location_value(&r), "https://lepre.dev/connected");
+        assert_eq!(location_value(&r), "https://lepre.run/connected");
         let c = cookie_value(&r);
         assert!(c.contains("lepre_oauth_state="));
         assert!(c.contains("Max-Age=0"));
@@ -78,7 +78,7 @@ mod tests {
         assert_eq!(r.status(), 302);
         assert_eq!(
             location_value(&r),
-            "https://lepre.dev/connect-failed?reason=user_denied"
+            "https://lepre.run/connect-failed?reason=user_denied"
         );
         let c = cookie_value(&r);
         assert!(c.contains("Max-Age=0"));
@@ -89,7 +89,7 @@ mod tests {
         let r = to_connect_failed_with_id("db_failure", "abc-123");
         assert_eq!(
             location_value(&r),
-            "https://lepre.dev/connect-failed?reason=db_failure&id=abc-123"
+            "https://lepre.run/connect-failed?reason=db_failure&id=abc-123"
         );
     }
 

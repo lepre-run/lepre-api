@@ -62,8 +62,8 @@ restructuring. The cost is paid once.
 ## Decision
 
 **Three repos, one CloudFormation stack on a single Rust Lambda
-fronted by API Gateway HTTP API at `api.lepre.dev`, Vite +
-React on Amplify at apex `lepre.dev`, Atlas M0 with tokens
+fronted by API Gateway HTTP API at `api.lepre.run`, Vite +
+React on Amplify at apex `lepre.run`, Atlas M0 with tokens
 encrypted at rest using AAD-bound AES-256-GCM, secrets in
 SSM, OAuth state set by a Lambda-served `/start` route.**
 
@@ -77,7 +77,7 @@ SSM, OAuth state set by a Lambda-served `/start` route.**
   interfaces named `{ComponentName}Props`, no class
   components, no `React.memo` without profiling, styles
   colocated. Three pages: `/` (the button — anchor tag with
-  static `href="https://api.lepre.dev/v1/auth/strava/start"`),
+  static `href="https://api.lepre.run/v1/auth/strava/start"`),
   `/connected` (static "Connected ✓"), `/connect-failed`
   (reads `?reason=…` from query, renders a known message for
   recognized slugs, a generic fallback for unrecognized
@@ -163,10 +163,10 @@ Handler:
    `Set-Cookie: lepre_oauth_state=<value>; Path=/v1/auth/strava;
    Max-Age=600; Secure; HttpOnly; SameSite=Lax` — host-only
    (no `Domain=` attribute, so the cookie is bound to
-   `api.lepre.dev` exactly and not its subdomains).
+   `api.lepre.run` exactly and not its subdomains).
 3. 302 to Strava authorize URL with `client_id`,
    `response_type=code`, `redirect_uri=
-   https://api.lepre.dev/v1/auth/strava/callback`,
+   https://api.lepre.run/v1/auth/strava/callback`,
    `scope=read,activity:read_all,profile:read_all`,
    `state=<value>`.
 
@@ -245,7 +245,7 @@ three headers are configured for the Amplify app via the
 CFN `AWS::Amplify::App.CustomHeaders` field so the SPA gets
 the same baseline. CORS is *not* set — the OAuth flow is
 top-level navigation. Slice 2 endpoints will add CORS scoped
-to `https://lepre.dev`.
+to `https://lepre.run`.
 
 ### 3. Stack contents (`customers/lepre/lepre-web.yaml`)
 
@@ -253,8 +253,8 @@ CFN parameters at the top of the template (no magic numbers
 in the body): `LambdaMemoryMb` (default 256),
 `LambdaTimeoutSeconds` (default 10), `LogRetentionDays`
 (default 7), `FunctionName` (default `lepre-api`),
-`ApiDomain` (default `api.lepre.dev`), `AppDomain`
-(default `lepre.dev`), `BootstrapS3Key` (default
+`ApiDomain` (default `api.lepre.run`), `AppDomain`
+(default `lepre.run`), `BootstrapS3Key` (default
 `lepre/bootstrap.zip`).
 
 Resources:
@@ -265,7 +265,7 @@ Resources:
   `{{resolve:ssm-secure:/lepre/web/amplify_github_token:1}}`).
   `CustomHeaders` populated with the three security headers
   above for `pattern: '**'`. Build env vars: none for slice 1
-  (all OAuth wiring is on `api.lepre.dev`, not the SPA).
+  (all OAuth wiring is on `api.lepre.run`, not the SPA).
 - `AWS::Amplify::Branch` for `main`,
   `EnableAutoBuild: true`. `AWS::Amplify::Domain` for
   `!Ref AppDomain` (apex; Cloudflare's CNAME flattening lets
@@ -556,7 +556,7 @@ real event-translation layer. `wiremock` serves Strava;
 
 - `button_page_renders_strava_href`: home page renders an
   anchor with
-  `href === "https://api.lepre.dev/v1/auth/strava/start"`.
+  `href === "https://api.lepre.run/v1/auth/strava/start"`.
 - `connected_page_renders_static_message`: `/connected`
   renders the success copy.
 - `connect_failed_renders_known_reason_message`: page with
@@ -593,7 +593,7 @@ the gate.
   the next steps run. The `infra-deployer` IAM expansion must
   land in this run, before any role deploy that depends on
   the new ARN list.
-- [ ] 5. Buy `lepre.dev` on Cloudflare. DNS stays at Cloudflare.
+- [ ] 5. Buy `lepre.run` on Cloudflare. DNS stays at Cloudflare.
 - [ ] 6. Provision Atlas M0; create DB user
   (`lepre_api`, SCRAM-SHA-256, strong password); allowlist
   `0.0.0.0/0`; record SRV URI.
@@ -616,9 +616,9 @@ the gate.
 - [ ] 10. Add the ACM validation CNAME at Cloudflare; wait
   for the cert to validate (~2–10 min). Stack reaches
   `CREATE_COMPLETE`. Read the
-  `ApiGatewayDomainNameTarget` output; add `api.lepre.dev`
+  `ApiGatewayDomainNameTarget` output; add `api.lepre.run`
   CNAME at Cloudflare pointing at it. Add the apex
-  `lepre.dev` record (CNAME-flattened to the Amplify-issued
+  `lepre.run` record (CNAME-flattened to the Amplify-issued
   CNAME target visible in the Amplify console after stack
   completion).
 - [ ] 11. Scaffold `lepre-web` (Vite + React + TS + Biome +
@@ -658,7 +658,7 @@ the gate.
 - **Lambda Function URL** instead of API Gateway HTTP API.
   Rejected: Strava only redirects to URLs whose registrable
   domain matches the app's "Authorization Callback Domain"
-  (`lepre.dev`); a Function URL on
+  (`lepre.run`); a Function URL on
   `*.lambda-url.eu-west-1.on.aws` doesn't qualify, so a
   custom domain via ACM + API Gateway (or via CloudFront) is
   unavoidable.

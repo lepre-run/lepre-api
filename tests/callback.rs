@@ -40,7 +40,7 @@ fn endpoints(strava_uri: &str) -> StravaEndpoints {
         authorize_url: Box::leak(format!("{strava_uri}/oauth/authorize").into_boxed_str()),
         token_url: Box::leak(token.into_boxed_str()),
         deauthorize_url: Box::leak(deauth.into_boxed_str()),
-        redirect_uri: "https://api.lepre.dev/v1/auth/strava/callback",
+        redirect_uri: "https://api.lepre.run/v1/auth/strava/callback",
     }
 }
 
@@ -49,7 +49,7 @@ fn callback_request(state_cookie: &str, query: &str) -> Request {
     http::Request::builder()
         .method("GET")
         .uri(format!(
-            "https://api.lepre.dev/v1/auth/strava/callback?{query}"
+            "https://api.lepre.run/v1/auth/strava/callback?{query}"
         ))
         .header(COOKIE, cookie_header)
         .body(Body::Empty)
@@ -97,7 +97,7 @@ async fn happy_path_writes_encrypted_doc_with_aad() {
 
     assert_eq!(resp.status(), 302);
     let location = resp.headers().get(http::header::LOCATION).unwrap();
-    assert_eq!(location, "https://lepre.dev/connected");
+    assert_eq!(location, "https://lepre.run/connected");
     let cookie = resp.headers().get(http::header::SET_COOKIE).unwrap();
     assert!(cookie.to_str().unwrap().contains("Max-Age=0"));
 
@@ -221,7 +221,7 @@ async fn mongo_failure_redirects_and_deauthorizes() {
         .to_str()
         .unwrap();
     assert!(
-        location.starts_with("https://lepre.dev/connect-failed?reason=db_failure&id="),
+        location.starts_with("https://lepre.run/connect-failed?reason=db_failure&id="),
         "got: {location}"
     );
 }
@@ -273,7 +273,7 @@ async fn partial_scope_redirects_to_connect_failed_scope_insufficient() {
     let location = resp.headers().get(http::header::LOCATION).unwrap();
     assert_eq!(
         location,
-        "https://lepre.dev/connect-failed?reason=scope_insufficient"
+        "https://lepre.run/connect-failed?reason=scope_insufficient"
     );
 
     // Nothing written to Mongo.
