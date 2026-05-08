@@ -260,7 +260,7 @@ in the body): `LambdaMemoryMb` (default 256),
 Resources:
 
 - `AWS::Amplify::App` for `lepre-web`, with GitHub source
-  integration (repo `francescobarbera/lepre-web`, access token
+  integration (repo `lepre-run/lepre-web`, access token
   resolved from SSM `/lepre/web/amplify_github_token` via CFN
   `{{resolve:ssm-secure:/lepre/web/amplify_github_token:1}}`).
   `CustomHeaders` populated with the three security headers
@@ -383,13 +383,12 @@ cold start, cached in `tokio::sync::OnceCell<Config>`.
 Handlers receive `&Config`. One injection seam for tests.
 
 **`lepre-deployer` (existing role, expanded):**
-- OIDC trust gains
-  `repo:francescobarbera/aws-infrastructure:ref:refs/heads/main`
-  in addition to the existing
-  `repo:francescobarbera/lepre:…` trust (the latter is dead
-  but kept until the old GitHub repo is archived; cleaning it
-  up is Implementation step 13, gated by Implementation 12 to
-  keep slice 1 from running with stale trust open).
+- OIDC trust replaced: the legacy
+  `repo:francescobarbera/lepre:…` subject is dropped (the new
+  app code lives under the `lepre-run` GitHub org, the legacy
+  repo will be archived); the role now trusts only
+  `repo:francescobarbera/aws-infrastructure:ref:refs/heads/main`,
+  which is the repo that deploys the `lepre-web` stack.
 - Amplify domain-association actions added to the existing
   `amplify-manage-app` policy:
   `amplify:CreateDomainAssociation`,
@@ -414,7 +413,7 @@ Handlers receive `&Config`. One injection seam for tests.
 
 **`lepre-api-deployer` (new, narrow role at
 `customers/lepre/api-deployer-role.yml`):** trust scoped to
-`repo:francescobarbera/lepre-api:ref:refs/heads/main`;
+`repo:lepre-run/lepre-api:ref:refs/heads/main`;
 permissions limited to `lambda:UpdateFunctionCode` on
 `arn:aws:lambda:eu-west-1:018532615177:function:lepre-api`.
 The function name is the literal `lepre-api` (matches the
@@ -574,8 +573,8 @@ the gate.
   `plans/008-strava-join.md`; commit as `chore: archive prior
   iteration`. (Decision history persists in git history of the
   archived `francescobarbera/lepre` GitHub repo.)
-- [ ] 2. Create new GitHub repos `francescobarbera/lepre-web`
-  and `francescobarbera/lepre-api`. Move
+- [ ] 2. Create new GitHub repos `lepre-run/lepre-web`
+  and `lepre-run/lepre-api`. Move
   `plans/008-strava-join.md` into the new `lepre-api` repo as
   `plans/001-strava-join.md` (renumbered now that it is the
   only ADR in its new home).
@@ -639,13 +638,11 @@ the gate.
 - [ ] 14. Flip status to `accepted` in
   `lepre-api/plans/001-strava-join.md` once §7 tests are
   green in CI on both repos and the smoke check passes.
-- [ ] 15. Tidy: remove the dead OIDC trust subject
-  `repo:francescobarbera/lepre:…` from `lepre-deployer` once
-  the old repo is archived. `[tidy]` commit, separate from
-  any behavior change. **Slice 1 must not be opened to
-  non-developer users until step 15 is complete** — leaving
-  the dead trust open extends the blast radius of any
-  collaborator who can push to the archived repo's `main`.
+- [x] 15. *(Done in this revision.)* The legacy
+  `repo:francescobarbera/lepre:…` OIDC trust subject was
+  dropped from `lepre-deployer` when the new app repos moved
+  to the `lepre-run` GitHub org. The legacy repo can be
+  archived at the user's leisure with no role coupling.
 
 ## Alternatives considered
 
@@ -726,11 +723,11 @@ the gate.
 - **Cloudflare-managed DNS + manual cert validation.** Adds
   a manual paste-CNAME step on every new ACM cert.
   Acceptable at one cert.
-- **Two OIDC trust subjects on `lepre-deployer`.** Both are
-  `francescobarbera/*` on `main` only. The dead
-  `francescobarbera/lepre` trust is removed in
-  Implementation step 15 — slice 1 must not open to
-  non-developer users before that step.
+- **`lepre-deployer` OIDC trust** is now scoped to a single
+  subject (`francescobarbera/aws-infrastructure` on `main`).
+  The legacy `francescobarbera/lepre` trust was dropped in
+  Implementation step 15 when the new app repos moved to
+  `lepre-run`.
 - **Stack name `lepre-web` covers Lambda + API GW too.**
   Documented misnomer; renaming forces stack replacement.
 - **`token_encryption_key` loss = total connection loss.**
