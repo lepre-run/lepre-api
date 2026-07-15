@@ -47,6 +47,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install Zig cross-compiler
+        run: pip3 install ziglang
+
       - name: Install cargo-lambda
         uses: cargo-bins/cargo-binstall@main
       - run: cargo binstall -y cargo-lambda
