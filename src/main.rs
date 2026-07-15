@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use lambda_http::{Error, service_fn};
+use lepre_api::application::Application;
 use lepre_api::{config, db, handler, strava};
 
 #[tokio::main]
@@ -24,13 +25,20 @@ async fn main() -> Result<(), Error> {
     let store = db::Store::new(
         aws_sdk_dynamodb::Client::new(&aws),
         config.table_name.clone(),
+        config.token_encryption_key,
+        config.key_version,
     );
     let http_client = strava::http_client()?;
+    let provider = strava::StravaProvider::new(
+        http_client,
+        config.strava_client_id.clone(),
+        config.strava_client_secret.clone(),
+    );
+    let application = Application::new(Arc::new(store), Arc::new(provider));
 
     let ctx = Arc::new(handler::Ctx {
         config,
-        store,
-        http_client,
+        application,
     });
 
     lambda_http::run(service_fn(move |req| {

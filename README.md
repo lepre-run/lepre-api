@@ -1,8 +1,8 @@
 # lepre-api
 
 Thin Rust Lambda fronting `api.lepre.run`. Workout records remain in the
-browser. DynamoDB contains only encrypted Strava tokens, browser sessions and
-short-lived webhook events.
+browser. DynamoDB contains only provider connections with encrypted tokens,
+browser sessions, external-account lookups and short-lived webhook events.
 
 Routes:
 
@@ -14,9 +14,17 @@ Routes:
 - `POST /v1/disconnect`
 - `GET|POST /v1/webhooks/strava`
 
-`GET /v1/workouts` returns only the Strava activity id, date and name. The id
-is synchronization metadata; the date and name are the only workout content
-persisted by the browser.
+`GET /v1/workouts` returns synchronization batches containing the provider-
+independent workout entity: id, performed time, name, moving-duration seconds
+and distance meters. It never persists those workouts.
+
+Code follows the Clean Architecture dependency rule:
+
+- `domain.rs` contains provider-independent entities and value objects.
+- `application.rs` contains use cases and outbound port traits.
+- `strava.rs` and `db.rs` implement provider and persistence adapters.
+- `handler.rs` maps API Gateway requests and DTOs into application operations.
+- `main.rs` is the composition root.
 
 ## Local verification
 

@@ -1,4 +1,4 @@
-//! AES-256-GCM token encryption with AAD-bound to athlete + token kind +
+//! AES-256-GCM token encryption with AAD-bound to connection + token kind +
 //! key version (ADR 001 §4).
 //!
 //! The AAD prevents ciphertext copy-paste attacks: a row whose ciphertext is
@@ -36,10 +36,10 @@ pub struct EncryptedToken {
 
 /// Build the AAD bound to a particular row + field.
 ///
-/// Format: `strava|athlete={athlete_id}|kind={access|refresh}|key={version}`.
-fn build_aad(athlete_id: i64, kind: TokenKind, key_version: i32) -> String {
+/// Format: `provider|connection={connection_id}|kind={access|refresh}|key={version}`.
+fn build_aad(connection_id: &str, kind: TokenKind, key_version: i32) -> String {
     format!(
-        "strava|athlete={athlete_id}|kind={kind}|key={key_version}",
+        "provider|connection={connection_id}|kind={kind}|key={key_version}",
         kind = kind.as_aad_str(),
     )
 }
@@ -49,7 +49,7 @@ fn build_aad(athlete_id: i64, kind: TokenKind, key_version: i32) -> String {
 /// A fresh 12-byte nonce is drawn from the OS CSPRNG for every call.
 pub fn encrypt(
     plaintext: &[u8],
-    athlete_id: i64,
+    connection_id: &str,
     kind: TokenKind,
     key_version: i32,
     key: &[u8; 32],
@@ -57,7 +57,7 @@ pub fn encrypt(
     let cipher = Aes256Gcm::new(key.into());
     let nonce_bytes: [u8; 12] = rand::rng().random();
     let nonce = Nonce::from(nonce_bytes);
-    let aad = build_aad(athlete_id, kind, key_version);
+    let aad = build_aad(connection_id, kind, key_version);
 
     let ciphertext = cipher
         .encrypt(
@@ -82,14 +82,14 @@ pub fn encrypt(
 /// here for symmetry and tests, and so slice 2 has a stable surface to call.
 pub fn decrypt(
     et: &EncryptedToken,
-    athlete_id: i64,
+    connection_id: &str,
     kind: TokenKind,
     key_version: i32,
     key: &[u8; 32],
 ) -> Result<Vec<u8>, anyhow::Error> {
     let cipher = Aes256Gcm::new(key.into());
     let nonce = Nonce::from(et.nonce);
-    let aad = build_aad(athlete_id, kind, key_version);
+    let aad = build_aad(connection_id, kind, key_version);
 
     cipher
         .decrypt(
@@ -108,48 +108,48 @@ mod tests {
     use std::collections::HashSet;
 
     const KEY: &[u8; 32] = b"01234567890123456789012345678901";
-    const ATHLETE: i64 = 12345;
+    const CONNECTION: &str = "connection-12345";
 
     #[test]
     fn token_encryption_roundtrip() {
         let plaintext = b"strava-access-token-abc123";
-        let et = encrypt(plaintext, ATHLETE, TokenKind::Access, 1, KEY).unwrap();
+        let et = encrypt(plaintext, CONNECTION, TokenKind::Access, 1, KEY).unwrap();
         assert_ne!(et.ciphertext, plaintext);
-        let got = decrypt(&et, ATHLETE, TokenKind::Access, 1, KEY).unwrap();
+        let got = decrypt(&et, CONNECTION, TokenKind::Access, 1, KEY).unwrap();
         assert_eq!(got, plaintext);
     }
 
     #[test]
-    fn decrypt_fails_with_wrong_athlete_id() {
-        let et = encrypt(b"secret", ATHLETE, TokenKind::Access, 1, KEY).unwrap();
-        let err = decrypt(&et, ATHLETE + 1, TokenKind::Access, 1, KEY).unwrap_err();
+    fn decrypt_fails_with_wrong_connection_id() {
+        let et = encrypt(b"secret", CONNECTION, TokenKind::Access, 1, KEY).unwrap();
+        let err = decrypt(&et, "other-connection", TokenKind::Access, 1, KEY).unwrap_err();
         assert!(err.to_string().contains("decryption failed"));
     }
 
     #[test]
     fn decrypt_fails_with_wrong_token_kind() {
-        let et = encrypt(b"access-tok", ATHLETE, TokenKind::Access, 1, KEY).unwrap();
-        decrypt(&et, ATHLETE, TokenKind::Refresh, 1, KEY).unwrap_err();
+        let et = encrypt(b"access-tok", CONNECTION, TokenKind::Access, 1, KEY).unwrap();
+        decrypt(&et, CONNECTION, TokenKind::Refresh, 1, KEY).unwrap_err();
     }
 
     #[test]
     fn decrypt_fails_with_wrong_key_version() {
-        let et = encrypt(b"tok", ATHLETE, TokenKind::Access, 1, KEY).unwrap();
-        decrypt(&et, ATHLETE, TokenKind::Access, 2, KEY).unwrap_err();
+        let et = encrypt(b"tok", CONNECTION, TokenKind::Access, 1, KEY).unwrap();
+        decrypt(&et, CONNECTION, TokenKind::Access, 2, KEY).unwrap_err();
     }
 
     #[test]
     fn decrypt_fails_with_wrong_key() {
         let alt_key: &[u8; 32] = b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-        let et = encrypt(b"tok", ATHLETE, TokenKind::Access, 1, KEY).unwrap();
-        decrypt(&et, ATHLETE, TokenKind::Access, 1, alt_key).unwrap_err();
+        let et = encrypt(b"tok", CONNECTION, TokenKind::Access, 1, KEY).unwrap();
+        decrypt(&et, CONNECTION, TokenKind::Access, 1, alt_key).unwrap_err();
     }
 
     #[test]
     fn nonce_unique_per_encryption() {
         let mut nonces = HashSet::with_capacity(1_000);
         for _ in 0..1_000 {
-            let et = encrypt(b"same payload", ATHLETE, TokenKind::Access, 1, KEY).unwrap();
+            let et = encrypt(b"same payload", CONNECTION, TokenKind::Access, 1, KEY).unwrap();
             nonces.insert(et.nonce);
         }
         assert_eq!(nonces.len(), 1_000, "nonce collision detected");

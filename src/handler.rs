@@ -1,6 +1,6 @@
-//! Lambda routes for OAuth, authenticated workout sync and Strava webhooks.
+//! HTTP inbound adapter for Lambda/API Gateway.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -9,38 +9,33 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use http::header::{CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE};
 use http::{Method, StatusCode};
 use lambda_http::{Body, Request, Response};
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
+use crate::application::{
+    Application, ApplicationError, SyncContinuation, SyncRequest, WebhookEvent,
+};
 use crate::config::Config;
 use crate::cookie::{
     clear_session_cookie, mint_state, read_session_cookie, read_state_cookie, set_state_cookie,
 };
-use crate::crypto::{TokenKind, decrypt, encrypt};
-use crate::db::{Connection, Store};
-use crate::{headers, redirect, strava};
+use crate::domain::{ExternalAccountId, User, Workout};
+use crate::{headers, redirect};
 
-const AUTHORIZE_URL: &str = "https://www.strava.com/oauth/authorize";
-const REDIRECT_URI: &str = "https://api.lepre.run/v1/auth/strava/callback";
-const REQUIRED_SCOPES: &[&str] = &["read", "activity:read_all"];
-const SESSION_SECONDS: i64 = 30 * 24 * 60 * 60;
 const APP_ORIGIN: &str = "https://lepre.run";
 
 pub struct Ctx {
     pub config: Config,
-    pub store: Store,
-    pub http_client: reqwest::Client,
+    pub application: Application,
 }
 
 pub async fn route(req: Request, ctx: Arc<Ctx>) -> Result<Response<Body>, lambda_http::Error> {
     let method = req.method().clone();
-    let path = req.uri().path();
-    let response = match (&method, path) {
+    let response = match (&method, req.uri().path()) {
         (&Method::OPTIONS, _) => empty(StatusCode::NO_CONTENT),
         (&Method::GET, "/v1/healthz") => json(StatusCode::OK, &serde_json::json!({"ok": true})),
-        (&Method::GET, "/v1/auth/strava/start") => strava_start(&ctx.config),
-        (&Method::GET, "/v1/auth/strava/callback") => strava_callback(&req, &ctx).await,
+        (&Method::GET, "/v1/auth/strava/start") => provider_start(&ctx),
+        (&Method::GET, "/v1/auth/strava/callback") => provider_callback(&req, &ctx).await,
         (&Method::GET, "/v1/session") => session(&req, &ctx).await,
         (&Method::GET, "/v1/workouts") => workouts(&req, &ctx).await,
         (&Method::POST, "/v1/disconnect") => disconnect(&req, &ctx).await,
@@ -54,28 +49,20 @@ pub async fn route(req: Request, ctx: Arc<Ctx>) -> Result<Response<Body>, lambda
     Ok(response)
 }
 
-fn strava_start(config: &Config) -> Response<Body> {
-    if !config.strava_configured() {
+fn provider_start(ctx: &Ctx) -> Response<Body> {
+    if !ctx.config.strava_configured() {
         return redirect::to_connect_failed("strava_not_configured");
     }
     let state = mint_state();
-    let query = serde_urlencoded::to_string(AuthorizeParams {
-        client_id: &config.strava_client_id,
-        response_type: "code",
-        redirect_uri: REDIRECT_URI,
-        scope: &REQUIRED_SCOPES.join(","),
-        state: &state,
-    })
-    .expect("static authorization parameters");
     headers::apply(http::Response::builder())
         .status(StatusCode::FOUND)
-        .header(LOCATION, format!("{AUTHORIZE_URL}?{query}"))
+        .header(LOCATION, ctx.application.authorization_url(&state))
         .header(SET_COOKIE, set_state_cookie(&state))
         .body(Body::Empty)
-        .expect("valid redirect")
+        .expect("valid provider authorization redirect")
 }
 
-async fn strava_callback(req: &Request, ctx: &Ctx) -> Response<Body> {
+async fn provider_callback(req: &Request, ctx: &Ctx) -> Response<Body> {
     if !ctx.config.strava_configured() {
         return redirect::to_connect_failed("strava_not_configured");
     }
@@ -87,7 +74,7 @@ async fn strava_callback(req: &Request, ctx: &Ctx) -> Response<Body> {
     let cookie_state = req
         .headers()
         .get(COOKIE)
-        .and_then(|v| v.to_str().ok())
+        .and_then(|value| value.to_str().ok())
         .and_then(read_state_cookie);
     let valid_state = match (&cookie_state, &query.state) {
         (Some(cookie), Some(query)) => bool::from(cookie.as_bytes().ct_eq(query.as_bytes())),
@@ -99,220 +86,84 @@ async fn strava_callback(req: &Request, ctx: &Ctx) -> Response<Body> {
     let Some(code) = query.code.as_deref() else {
         return redirect::to_connect_failed("missing_code");
     };
-
-    let token = match strava::exchange_code(
-        &ctx.http_client,
-        strava::token_url(),
-        &ctx.config.strava_client_id,
-        &ctx.config.strava_client_secret,
-        code,
-    )
-    .await
-    {
-        Ok(token) => token,
-        Err(error) => {
-            tracing::error!(%error, "Strava token exchange failed");
-            return redirect::to_connect_failed("strava_exchange_failed");
-        }
+    let Some(scopes) = query.scope.as_deref() else {
+        return redirect::to_connect_failed("scope_insufficient");
     };
-    if !scope_sufficient(query.scope.as_deref()) {
-        let _ = strava::deauthorize(
-            &ctx.http_client,
-            strava::deauthorize_url(),
-            &token.access_token,
-        )
-        .await;
+    if !ctx.application.scopes_sufficient(scopes) {
         return redirect::to_connect_failed("scope_insufficient");
     }
-
-    let connection = match encrypted_connection(
-        &ctx.config,
-        token.athlete.id,
-        &token.access_token,
-        &token.refresh_token,
-        token.expires_at,
-        1,
-    ) {
-        Ok(connection) => connection,
+    match ctx.application.connect(code, now_seconds()).await {
+        Ok(session) => redirect::to_connected_with_session(&session),
         Err(error) => {
-            tracing::error!(%error, "token encryption failed");
-            return redirect::to_connect_failed("unknown");
+            tracing::error!(%error, "provider connection failed");
+            let reason = match error {
+                ApplicationError::Provider(_) => "strava_exchange_failed",
+                ApplicationError::Persistence(_) => "db_failure",
+                _ => "unknown",
+            };
+            redirect::to_connect_failed(reason)
         }
-    };
-    let session = new_session();
-    if let Err(error) = ctx.store.put_connection(&connection).await {
-        tracing::error!(%error, "connection persistence failed");
-        return redirect::to_connect_failed("db_failure");
     }
-    if let Err(error) = ctx
-        .store
-        .create_session(&session, token.athlete.id, now_seconds() + SESSION_SECONDS)
-        .await
-    {
-        tracing::error!(%error, "session persistence failed");
-        return redirect::to_connect_failed("db_failure");
-    }
-    redirect::to_connected_with_session(&session)
 }
 
 async fn session(req: &Request, ctx: &Ctx) -> Response<Body> {
-    match authenticate(req, ctx).await {
-        Ok(Some(athlete_id)) => json(
-            StatusCode::OK,
-            &serde_json::json!({"authenticated":true,"athleteId":athlete_id}),
-        ),
-        Ok(None) => json(
+    let Some(raw_session) = session_cookie(req) else {
+        return json(
             StatusCode::UNAUTHORIZED,
-            &serde_json::json!({"authenticated":false}),
+            &serde_json::json!({"error":"unauthorized"}),
+        );
+    };
+    match ctx
+        .application
+        .current_user(&raw_session, now_seconds())
+        .await
+    {
+        Ok(Some(user)) => json(StatusCode::OK, &UserResponse::from(&user)),
+        Ok(None) | Err(ApplicationError::Unauthorized) => json(
+            StatusCode::UNAUTHORIZED,
+            &serde_json::json!({"error":"unauthorized"}),
         ),
-        Err(error) => internal(error),
+        Err(error) => application_error(error),
     }
-}
-
-#[derive(Default, Deserialize)]
-struct SyncQuery {
-    after: Option<i64>,
-    cursor: Option<i64>,
-    snapshot: Option<i64>,
-    page: Option<i64>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SyncResponse {
-    workouts: Vec<strava::Workout>,
-    deleted_ids: Vec<i64>,
-    synced_at: i64,
-    cursor: i64,
-    snapshot: i64,
-    next_page: Option<i64>,
 }
 
 async fn workouts(req: &Request, ctx: &Ctx) -> Response<Body> {
-    let athlete_id = match authenticate(req, ctx).await {
-        Ok(Some(id)) => id,
-        Ok(None) => {
+    let Some(raw_session) = session_cookie(req) else {
+        return json(
+            StatusCode::UNAUTHORIZED,
+            &serde_json::json!({"error":"unauthorized"}),
+        );
+    };
+    let request = match sync_request(req.uri().query().unwrap_or(""), now_millis()) {
+        Ok(request) => request,
+        Err(_) => {
             return json(
-                StatusCode::UNAUTHORIZED,
-                &serde_json::json!({"error":"unauthorized"}),
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({"error":"invalid_synchronization"}),
             );
         }
-        Err(error) => return internal(error),
     };
-    let query: SyncQuery =
-        serde_urlencoded::from_str(req.uri().query().unwrap_or("")).unwrap_or_default();
-    let Some(page) = query.page else {
-        return json(
-            StatusCode::BAD_REQUEST,
-            &serde_json::json!({"error":"paged_sync_required"}),
-        );
-    };
-    if !(1..=30).contains(&page) {
-        return json(
-            StatusCode::BAD_REQUEST,
-            &serde_json::json!({"error":"invalid_sync_page"}),
-        );
-    }
-    let after = query.after.unwrap_or(0).max(0);
-    let event_cursor = query.cursor.unwrap_or(0).max(0);
-    let snapshot_ms = query.snapshot.unwrap_or_else(now_millis).max(1);
-    // Strava's `before` parameter is in seconds. Adding one keeps activities
-    // created during the snapshot second inside this stable import window.
-    let before = snapshot_ms / 1000 + 1;
-    let access_token = match valid_access_token(ctx, athlete_id).await {
-        Ok(token) => token,
-        Err(error) => return internal(error),
-    };
-    let mut workouts = match strava::activities_page(
-        &ctx.http_client,
-        strava::activities_url(),
-        &access_token,
-        after,
-        before,
-        page,
-    )
-    .await
+    match ctx
+        .application
+        .synchronize(&raw_session, request, now_seconds())
+        .await
     {
-        Ok(workouts) => workouts,
-        Err(error) => return upstream(error),
-    };
-    let has_more = workouts.len() == 200;
-    if has_more && page == 30 {
-        return upstream(anyhow::anyhow!("activity import exceeded 6000 activities"));
+        Ok(batch) => json(StatusCode::OK, &SyncResponse::from(batch)),
+        Err(error) => application_error(error),
     }
-    let events = if has_more {
-        Vec::new()
-    } else {
-        match ctx
-            .store
-            .webhook_events(athlete_id, event_cursor, snapshot_ms)
-            .await
-        {
-            Ok(events) => events,
-            Err(error) => return internal(error),
-        }
-    };
-    let mut deleted = HashSet::new();
-    let present: HashSet<i64> = workouts.iter().map(|workout| workout.id).collect();
-    for event in events {
-        if event.aspect_type == "delete" {
-            deleted.insert(event.object_id);
-        } else if !present.contains(&event.object_id) {
-            match strava::activity(
-                &ctx.http_client,
-                strava::activity_url(),
-                &access_token,
-                event.object_id,
-            )
-            .await
-            {
-                Ok(Some(workout)) => workouts.push(workout),
-                Ok(None) => {
-                    deleted.insert(event.object_id);
-                }
-                Err(error) => {
-                    tracing::warn!(%error, activity_id = event.object_id, "could not fetch webhook activity")
-                }
-            }
-        }
-    }
-    workouts.retain(|workout| !deleted.contains(&workout.id));
-    workouts.sort_by(|a, b| b.date.cmp(&a.date));
-    json(
-        StatusCode::OK,
-        &SyncResponse {
-            workouts,
-            deleted_ids: deleted.into_iter().collect(),
-            synced_at: snapshot_ms / 1000,
-            cursor: snapshot_ms,
-            snapshot: snapshot_ms,
-            next_page: has_more.then_some(page + 1),
-        },
-    )
 }
 
 async fn disconnect(req: &Request, ctx: &Ctx) -> Response<Body> {
-    let raw_session = session_cookie(req);
-    let athlete_id = match authenticate(req, ctx).await {
-        Ok(Some(id)) => id,
-        Ok(None) => return clear_session(json(StatusCode::NO_CONTENT, &serde_json::json!({}))),
-        Err(error) => return internal(error),
+    let result = match session_cookie(req) {
+        Some(session) => ctx.application.disconnect(&session, now_seconds()).await,
+        None => Ok(()),
     };
-    if let Ok(access) = valid_access_token(ctx, athlete_id).await
-        && let Err(error) =
-            strava::deauthorize(&ctx.http_client, strava::deauthorize_url(), &access).await
-    {
-        tracing::warn!(%error, "Strava deauthorization failed");
+    match result {
+        Ok(()) | Err(ApplicationError::Unauthorized) => {
+            clear_session(empty(StatusCode::NO_CONTENT))
+        }
+        Err(error) => application_error(error),
     }
-    if let Err(error) = ctx.store.delete_connection(athlete_id).await {
-        return internal(error);
-    }
-    if let Some(session) = raw_session
-        && let Err(error) = ctx.store.delete_session(&session).await
-    {
-        return internal(error);
-    }
-    clear_session(empty(StatusCode::NO_CONTENT))
 }
 
 #[derive(Deserialize)]
@@ -368,136 +219,34 @@ async fn receive_webhook(req: &Request, ctx: &Ctx) -> Response<Body> {
             );
         }
     };
-    if payload.object_type == "athlete"
-        && payload.updates.get("authorized").and_then(|v| v.as_str()) == Some("false")
-    {
-        if let Err(error) = ctx.store.delete_connection(payload.owner_id).await {
-            return internal(error);
-        }
-    } else if payload.object_type == "activity"
-        && let Err(error) = ctx
-            .store
-            .put_webhook_event(
-                payload.owner_id,
-                payload.object_id,
-                &payload.aspect_type,
-                now_millis(),
-            )
-            .await
-    {
-        return internal(error);
-    }
-    json(StatusCode::OK, &serde_json::json!({}))
-}
-
-async fn authenticate(req: &Request, ctx: &Ctx) -> Result<Option<i64>, anyhow::Error> {
-    let Some(session) = session_cookie(req) else {
-        return Ok(None);
+    let external_account_id = match ExternalAccountId::new(payload.owner_id.to_string()) {
+        Ok(value) => value,
+        Err(error) => return application_error(ApplicationError::Domain(error)),
     };
-    ctx.store.athlete_for_session(&session, now_seconds()).await
-}
-
-fn session_cookie(req: &Request) -> Option<String> {
-    req.headers()
-        .get(COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(read_session_cookie)
-}
-
-async fn valid_access_token(ctx: &Ctx, athlete_id: i64) -> Result<String, anyhow::Error> {
-    for _ in 0..2 {
-        let connection = ctx
-            .store
-            .get_connection(athlete_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Strava connection not found"))?;
-        if connection.token_expires_at > now_seconds() + 60 {
-            return token_plaintext(&ctx.config, &connection, TokenKind::Access);
+    let event = if payload.object_type == "athlete"
+        && payload
+            .updates
+            .get("authorized")
+            .and_then(|value| value.as_str())
+            == Some("false")
+    {
+        WebhookEvent::AuthorizationRevoked {
+            external_account_id,
         }
-        let refresh = token_plaintext(&ctx.config, &connection, TokenKind::Refresh)?;
-        let refreshed = strava::refresh_token(
-            &ctx.http_client,
-            strava::token_url(),
-            &ctx.config.strava_client_id,
-            &ctx.config.strava_client_secret,
-            &refresh,
-        )
-        .await?;
-        let replacement = encrypted_connection(
-            &ctx.config,
-            athlete_id,
-            &refreshed.access_token,
-            &refreshed.refresh_token,
-            refreshed.expires_at,
-            connection.token_version + 1,
-        )?;
-        if ctx
-            .store
-            .replace_tokens(&replacement, connection.token_version)
-            .await?
-        {
-            return Ok(refreshed.access_token);
+    } else if payload.object_type == "activity" {
+        WebhookEvent::WorkoutChanged {
+            external_account_id,
+            external_workout_id: payload.object_id,
+            aspect: payload.aspect_type,
+            received_at_millis: now_millis(),
         }
-    }
-    anyhow::bail!("concurrent token refresh did not settle")
-}
-
-fn token_plaintext(
-    config: &Config,
-    connection: &Connection,
-    kind: TokenKind,
-) -> Result<String, anyhow::Error> {
-    let encrypted = match kind {
-        TokenKind::Access => &connection.access_token,
-        TokenKind::Refresh => &connection.refresh_token,
+    } else {
+        return json(StatusCode::OK, &serde_json::json!({}));
     };
-    let bytes = decrypt(
-        encrypted,
-        connection.athlete_id,
-        kind,
-        connection.key_version,
-        &config.token_encryption_key,
-    )?;
-    String::from_utf8(bytes).map_err(Into::into)
-}
-
-fn encrypted_connection(
-    config: &Config,
-    athlete_id: i64,
-    access: &str,
-    refresh: &str,
-    expires_at: i64,
-    token_version: i64,
-) -> Result<Connection, anyhow::Error> {
-    Ok(Connection {
-        athlete_id,
-        access_token: encrypt(
-            access.as_bytes(),
-            athlete_id,
-            TokenKind::Access,
-            config.key_version,
-            &config.token_encryption_key,
-        )?,
-        refresh_token: encrypt(
-            refresh.as_bytes(),
-            athlete_id,
-            TokenKind::Refresh,
-            config.key_version,
-            &config.token_encryption_key,
-        )?,
-        key_version: config.key_version,
-        token_version,
-        token_expires_at: expires_at,
-    })
-}
-
-#[derive(Serialize)]
-struct AuthorizeParams<'a> {
-    client_id: &'a str,
-    response_type: &'static str,
-    redirect_uri: &'a str,
-    scope: &'a str,
-    state: &'a str,
+    match ctx.application.record_webhook(event).await {
+        Ok(()) => json(StatusCode::OK, &serde_json::json!({})),
+        Err(error) => application_error(error),
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -508,15 +257,166 @@ struct CallbackQuery {
     error: Option<String>,
 }
 
-fn scope_sufficient(scopes: Option<&str>) -> bool {
-    let Some(scopes) = scopes else { return false };
-    let granted: HashSet<_> = scopes.split(',').map(str::trim).collect();
-    REQUIRED_SCOPES.iter().all(|scope| granted.contains(scope))
+#[derive(Default, Deserialize)]
+struct SyncQuery {
+    checkpoint: Option<String>,
+    continuation: Option<String>,
 }
 
-fn new_session() -> String {
-    let bytes: [u8; 32] = rand::rng().random();
-    URL_SAFE_NO_PAD.encode(bytes)
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckpointToken {
+    after_seconds: i64,
+    event_cursor_millis: i64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ContinuationToken {
+    after_seconds: i64,
+    event_cursor_millis: i64,
+    snapshot_millis: i64,
+    page: i64,
+}
+
+fn sync_request(query: &str, snapshot_millis: i64) -> Result<SyncRequest, anyhow::Error> {
+    let query: SyncQuery = serde_urlencoded::from_str(query)?;
+    match (query.checkpoint, query.continuation) {
+        (Some(_), Some(_)) => anyhow::bail!("checkpoint and continuation are mutually exclusive"),
+        (_, Some(value)) => {
+            let token: ContinuationToken = decode_token(&value)?;
+            Ok(SyncRequest {
+                after_seconds: token.after_seconds,
+                event_cursor_millis: token.event_cursor_millis,
+                snapshot_millis: token.snapshot_millis,
+                page: token.page,
+            })
+        }
+        (Some(value), None) => {
+            let checkpoint: CheckpointToken = decode_token(&value)?;
+            Ok(SyncRequest {
+                after_seconds: checkpoint.after_seconds,
+                event_cursor_millis: checkpoint.event_cursor_millis,
+                snapshot_millis,
+                page: 1,
+            })
+        }
+        (None, None) => Ok(SyncRequest {
+            after_seconds: 0,
+            event_cursor_millis: 0,
+            snapshot_millis,
+            page: 1,
+        }),
+    }
+}
+
+fn encode_token(value: &impl Serialize) -> String {
+    URL_SAFE_NO_PAD.encode(serde_json::to_vec(value).expect("serializable sync token"))
+}
+
+fn decode_token<Value: for<'de> Deserialize<'de>>(value: &str) -> Result<Value, anyhow::Error> {
+    Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(value)?)?)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectionResponse<'a> {
+    id: &'a str,
+    provider: &'static str,
+    external_account_id: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UserResponse<'a> {
+    id: &'a str,
+    first_name: &'a str,
+    last_name: &'a str,
+    connection: ConnectionResponse<'a>,
+}
+
+impl<'a> From<&'a User> for UserResponse<'a> {
+    fn from(user: &'a User) -> Self {
+        Self {
+            id: user.id.as_str(),
+            first_name: &user.first_name,
+            last_name: &user.last_name,
+            connection: ConnectionResponse {
+                id: user.connection.id.as_str(),
+                provider: user.connection.provider.as_str(),
+                external_account_id: user.connection.external_account_id.as_str(),
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkoutResponse {
+    id: String,
+    performed_at: String,
+    name: String,
+    duration_seconds: i64,
+    distance_meters: f64,
+}
+
+impl From<Workout> for WorkoutResponse {
+    fn from(workout: Workout) -> Self {
+        Self {
+            id: workout.id.to_string(),
+            performed_at: workout.performed_at,
+            name: workout.name,
+            duration_seconds: workout.duration_seconds,
+            distance_meters: workout.distance_meters,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum ContinuationResponse {
+    More { token: String },
+    Complete { checkpoint: String },
+}
+
+#[derive(Serialize)]
+struct SyncResponse {
+    upserted: Vec<WorkoutResponse>,
+    removed: Vec<String>,
+    continuation: ContinuationResponse,
+}
+
+impl From<crate::application::SyncBatch> for SyncResponse {
+    fn from(batch: crate::application::SyncBatch) -> Self {
+        let continuation = match batch.continuation {
+            SyncContinuation::More(request) => ContinuationResponse::More {
+                token: encode_token(&ContinuationToken {
+                    after_seconds: request.after_seconds,
+                    event_cursor_millis: request.event_cursor_millis,
+                    snapshot_millis: request.snapshot_millis,
+                    page: request.page,
+                }),
+            },
+            SyncContinuation::Complete(checkpoint) => ContinuationResponse::Complete {
+                checkpoint: encode_token(&CheckpointToken {
+                    after_seconds: checkpoint.after_seconds,
+                    event_cursor_millis: checkpoint.event_cursor_millis,
+                }),
+            },
+        };
+        Self {
+            upserted: batch.upserted.into_iter().map(Into::into).collect(),
+            removed: batch.removed.into_iter().map(|id| id.to_string()).collect(),
+            continuation,
+        }
+    }
+}
+
+fn session_cookie(req: &Request) -> Option<String> {
+    req.headers()
+        .get(COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(read_session_cookie)
 }
 
 fn body_bytes(req: &Request) -> &[u8] {
@@ -530,6 +430,7 @@ fn body_bytes(req: &Request) -> &[u8] {
 fn now_seconds() -> i64 {
     now_millis() / 1000
 }
+
 fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -562,20 +463,31 @@ fn cors(builder: http::response::Builder) -> http::response::Builder {
         .header("Vary", "Origin")
 }
 
-fn internal(error: anyhow::Error) -> Response<Body> {
-    tracing::error!(%error, "internal API error");
-    json(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        &serde_json::json!({"error":"internal_error"}),
-    )
-}
-
-fn upstream(error: anyhow::Error) -> Response<Body> {
-    tracing::error!(%error, "Strava API error");
-    json(
-        StatusCode::BAD_GATEWAY,
-        &serde_json::json!({"error":"strava_unavailable"}),
-    )
+fn application_error(error: ApplicationError) -> Response<Body> {
+    match error {
+        ApplicationError::Unauthorized => json(
+            StatusCode::UNAUTHORIZED,
+            &serde_json::json!({"error":"unauthorized"}),
+        ),
+        ApplicationError::InvalidSynchronization => json(
+            StatusCode::BAD_REQUEST,
+            &serde_json::json!({"error":"invalid_synchronization"}),
+        ),
+        ApplicationError::Provider(error) => {
+            tracing::error!(%error, "provider operation failed");
+            json(
+                StatusCode::BAD_GATEWAY,
+                &serde_json::json!({"error":"provider_unavailable"}),
+            )
+        }
+        error => {
+            tracing::error!(%error, "application operation failed");
+            json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &serde_json::json!({"error":"internal_error"}),
+            )
+        }
+    }
 }
 
 fn clear_session(mut response: Response<Body>) -> Response<Body> {
@@ -589,20 +501,58 @@ fn clear_session(mut response: Response<Body>) -> Response<Body> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::SyncBatch;
+    use crate::domain::WorkoutId;
 
     #[test]
-    fn scopes_are_least_privilege_and_include_private_activities() {
-        assert!(scope_sufficient(Some("read,activity:read_all")));
-        assert!(!scope_sufficient(Some("read")));
-        assert_eq!(REQUIRED_SCOPES, &["read", "activity:read_all"]);
+    fn synchronization_tokens_roundtrip_without_nullable_fields() {
+        let checkpoint = CheckpointToken {
+            after_seconds: 123,
+            event_cursor_millis: 456,
+        };
+        let encoded = encode_token(&checkpoint);
+        let decoded: CheckpointToken = decode_token(&encoded).unwrap();
+        assert_eq!(decoded.after_seconds, 123);
+        assert_eq!(decoded.event_cursor_millis, 456);
     }
 
     #[test]
-    fn session_tokens_are_random_and_url_safe() {
-        let first = new_session();
-        let second = new_session();
-        assert_eq!(first.len(), 43);
-        assert_ne!(first, second);
-        assert!(!first.contains('='));
+    fn initial_synchronization_has_explicit_defaults() {
+        assert_eq!(
+            sync_request("", 1_000).unwrap(),
+            SyncRequest {
+                after_seconds: 0,
+                event_cursor_millis: 0,
+                snapshot_millis: 1_000,
+                page: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn workout_contract_contains_seconds_and_meters() {
+        let response = SyncResponse::from(SyncBatch {
+            upserted: vec![
+                Workout::new(
+                    WorkoutId::new("strava:7").unwrap(),
+                    "2026-07-15T06:00:00Z",
+                    "Morning Run",
+                    3600,
+                    10_050.5,
+                )
+                .unwrap(),
+            ],
+            removed: Vec::new(),
+            continuation: SyncContinuation::Complete(crate::application::SyncCheckpoint {
+                after_seconds: 123,
+                event_cursor_millis: 456,
+            }),
+        });
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["upserted"][0]["id"], "strava:7");
+        assert_eq!(value["upserted"][0]["durationSeconds"], 3600);
+        assert_eq!(value["upserted"][0]["distanceMeters"], 10_050.5);
+        assert_eq!(value["continuation"]["kind"], "complete");
+        assert!(value["continuation"]["checkpoint"].is_string());
     }
 }
