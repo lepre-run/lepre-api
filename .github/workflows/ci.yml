@@ -52,7 +52,7 @@ jobs:
 
       - name: Install cargo-lambda
         uses: cargo-bins/cargo-binstall@main
-      - run: cargo binstall -y cargo-lambda
+      - run: cargo binstall --force -y cargo-lambda
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
