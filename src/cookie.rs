@@ -14,6 +14,7 @@ pub const STATE_COOKIE_NAME: &str = "lepre_oauth_state";
 
 /// `Path` attribute used for set + delete (must match for the deletion to take).
 pub const STATE_COOKIE_PATH: &str = "/v1/auth/strava";
+pub const SESSION_COOKIE_NAME: &str = "lepre_session";
 
 const STATE_COOKIE_MAX_AGE_SECONDS: u32 = 600;
 
@@ -48,14 +49,28 @@ pub fn clear_state_cookie() -> &'static str {
 
 /// Read the value of `lepre_oauth_state` from a `Cookie:` header value, if present.
 pub fn read_state_cookie(cookie_header: &str) -> Option<String> {
+    read_cookie(cookie_header, STATE_COOKIE_NAME)
+}
+
+pub fn read_session_cookie(cookie_header: &str) -> Option<String> {
+    read_cookie(cookie_header, SESSION_COOKIE_NAME)
+}
+
+fn read_cookie(cookie_header: &str, name: &str) -> Option<String> {
     cookie_header.split(';').map(str::trim).find_map(|kv| {
         let (k, v) = kv.split_once('=')?;
-        if k == STATE_COOKIE_NAME {
-            Some(v.to_owned())
-        } else {
-            None
-        }
+        if k == name { Some(v.to_owned()) } else { None }
     })
+}
+
+pub fn set_session_cookie(session: &str) -> String {
+    format!(
+        "{SESSION_COOKIE_NAME}={session}; Path=/; Max-Age=2592000; Secure; HttpOnly; SameSite=Lax"
+    )
+}
+
+pub fn clear_session_cookie() -> &'static str {
+    "lepre_session=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax"
 }
 
 #[cfg(test)]

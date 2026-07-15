@@ -5,7 +5,7 @@ use http::header::{LOCATION, SET_COOKIE};
 use lambda_http::Body;
 use lambda_http::Response;
 
-use crate::cookie::clear_state_cookie;
+use crate::cookie::{clear_state_cookie, set_session_cookie};
 use crate::headers;
 
 const APP_BASE: &str = "https://lepre.run";
@@ -26,6 +26,17 @@ pub fn redirect_with_cookie_clear(path_with_query: &str) -> Response<Body> {
 /// Sugar for the success path.
 pub fn to_connected() -> Response<Body> {
     redirect_with_cookie_clear("/connected")
+}
+
+pub fn to_connected_with_session(session: &str) -> Response<Body> {
+    let mut response = redirect_with_cookie_clear("/connected");
+    response.headers_mut().append(
+        SET_COOKIE,
+        set_session_cookie(session)
+            .parse()
+            .expect("valid session cookie"),
+    );
+    response
 }
 
 /// Sugar for failure paths.

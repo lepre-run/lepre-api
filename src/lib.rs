@@ -1,5 +1,5 @@
 //! `lepre-api` library: shared modules used by both the Lambda binary
-//! (`src/main.rs`) and the integration test (`tests/callback.rs`).
+//! (`src/main.rs`) and tests.
 
 pub mod config;
 pub mod cookie;

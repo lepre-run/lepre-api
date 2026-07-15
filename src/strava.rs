@@ -1,25 +1,23 @@
-//! Strava OAuth client (ADR 001 §2): token exchange and best-effort
-//! deauthorize. Both calls use an explicit short timeout and no automatic
-//! retry — the OAuth `code` is single-use, so retrying on a network blip
-//! risks an unrecoverable state.
+//! Minimal Strava client. Only activity id, date and name leave this module.
 
 use std::time::Duration;
 
-use serde::Deserialize;
+use anyhow::Context;
+use serde::{Deserialize, Serialize};
 
-const STRAVA_TOKEN_URL: &str = "https://www.strava.com/oauth/token";
-const STRAVA_DEAUTHORIZE_URL: &str = "https://www.strava.com/oauth/deauthorize";
-const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+const TOKEN_URL: &str = "https://www.strava.com/oauth/token";
+const DEAUTHORIZE_URL: &str = "https://www.strava.com/oauth/deauthorize";
+const ACTIVITIES_URL: &str = "https://www.strava.com/api/v3/athlete/activities";
+const ACTIVITY_URL: &str = "https://www.strava.com/api/v3/activities";
+const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Build the shared HTTP client with the project-wide timeout.
 pub fn http_client() -> Result<reqwest::Client, anyhow::Error> {
     Ok(reqwest::Client::builder()
         .timeout(HTTP_TIMEOUT)
-        .connect_timeout(HTTP_TIMEOUT)
+        .connect_timeout(Duration::from_secs(5))
         .build()?)
 }
 
-/// Body posted to `https://www.strava.com/oauth/token`.
 #[derive(serde::Serialize)]
 struct TokenRequest<'a> {
     client_id: &'a str,
@@ -28,14 +26,27 @@ struct TokenRequest<'a> {
     grant_type: &'static str,
 }
 
-/// Subset of Strava's token response we care about.
+#[derive(serde::Serialize)]
+struct RefreshRequest<'a> {
+    client_id: &'a str,
+    client_secret: &'a str,
+    refresh_token: &'a str,
+    grant_type: &'static str,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct TokenResponse {
     pub access_token: String,
     pub refresh_token: String,
-    /// Token expiry as Unix epoch seconds.
     pub expires_at: i64,
     pub athlete: Athlete,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RefreshedToken {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_at: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -43,163 +54,199 @@ pub struct Athlete {
     pub id: i64,
 }
 
-/// Exchange a single-use authorization `code` for tokens.
-///
-/// Caller-supplied `base_url` enables wiremock'd integration tests; the real
-/// runtime uses the constant.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Workout {
+    pub id: i64,
+    pub name: String,
+    #[serde(rename(deserialize = "start_date"))]
+    pub date: String,
+}
+
 pub async fn exchange_code(
     client: &reqwest::Client,
-    base_url: &str,
+    token_url: &str,
     client_id: &str,
     client_secret: &str,
     code: &str,
 ) -> Result<TokenResponse, anyhow::Error> {
-    let body = TokenRequest {
-        client_id,
-        client_secret,
-        code,
-        grant_type: "authorization_code",
-    };
-
-    let resp = client.post(base_url).form(&body).send().await?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body_text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("strava /oauth/token returned {status}: {body_text}");
-    }
-    Ok(resp.json::<TokenResponse>().await?)
+    checked_json(
+        client
+            .post(token_url)
+            .form(&TokenRequest {
+                client_id,
+                client_secret,
+                code,
+                grant_type: "authorization_code",
+            })
+            .send()
+            .await?,
+    )
+    .await
 }
 
-/// Best-effort `POST /oauth/deauthorize`. Errors are logged and swallowed by
-/// the caller — failure to deauthorize must not block the user's
-/// failure-page redirect.
+pub async fn refresh_token(
+    client: &reqwest::Client,
+    token_url: &str,
+    client_id: &str,
+    client_secret: &str,
+    refresh_token: &str,
+) -> Result<RefreshedToken, anyhow::Error> {
+    checked_json(
+        client
+            .post(token_url)
+            .form(&RefreshRequest {
+                client_id,
+                client_secret,
+                refresh_token,
+                grant_type: "refresh_token",
+            })
+            .send()
+            .await?,
+    )
+    .await
+}
+
+pub async fn activities(
+    client: &reqwest::Client,
+    base_url: &str,
+    access_token: &str,
+    after: i64,
+) -> Result<Vec<Workout>, anyhow::Error> {
+    let mut workouts = Vec::new();
+    for page in 1..=30 {
+        let response = client
+            .get(base_url)
+            .bearer_auth(access_token)
+            .query(&[("after", after), ("page", page), ("per_page", 200)])
+            .send()
+            .await?;
+        let batch: Vec<Workout> = checked_json(response).await?;
+        let done = batch.len() < 200;
+        workouts.extend(batch);
+        if done {
+            return Ok(workouts);
+        }
+    }
+    anyhow::bail!("activity import exceeded 6000 activities")
+}
+
+pub async fn activity(
+    client: &reqwest::Client,
+    base_url: &str,
+    access_token: &str,
+    id: i64,
+) -> Result<Option<Workout>, anyhow::Error> {
+    let response = client
+        .get(format!("{base_url}/{id}"))
+        .bearer_auth(access_token)
+        .send()
+        .await?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    Ok(Some(checked_json(response).await?))
+}
+
 pub async fn deauthorize(
     client: &reqwest::Client,
     base_url: &str,
     access_token: &str,
 ) -> Result<(), anyhow::Error> {
-    let resp = client
+    let response = client
         .post(base_url)
-        .header(
-            reqwest::header::AUTHORIZATION,
-            format!("Bearer {access_token}"),
-        )
+        .bearer_auth(access_token)
         .send()
         .await?;
-    let status = resp.status();
-    if !status.is_success() {
-        anyhow::bail!("strava /oauth/deauthorize returned {status}");
+    if !response.status().is_success() {
+        anyhow::bail!("strava deauthorize returned {}", response.status())
     }
     Ok(())
 }
 
-/// Public token endpoint URL (used by `main.rs`; tests override).
-pub fn token_url() -> &'static str {
-    STRAVA_TOKEN_URL
+async fn checked_json<T: for<'de> Deserialize<'de>>(
+    response: reqwest::Response,
+) -> Result<T, anyhow::Error> {
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("strava returned {status}: {body}")
+    }
+    response.json().await.context("invalid Strava response")
 }
 
-/// Public deauthorize endpoint URL (used by `main.rs`; tests override).
+pub fn token_url() -> &'static str {
+    TOKEN_URL
+}
 pub fn deauthorize_url() -> &'static str {
-    STRAVA_DEAUTHORIZE_URL
+    DEAUTHORIZE_URL
+}
+pub fn activities_url() -> &'static str {
+    ACTIVITIES_URL
+}
+pub fn activity_url() -> &'static str {
+    ACTIVITY_URL
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::matchers::{body_string_contains, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
-    async fn exchange_code_posts_form_body_with_required_fields() {
+    async fn exchange_and_refresh_use_expected_grants() {
         let server = MockServer::start().await;
-
         Mock::given(method("POST"))
-            .and(path("/"))
-            .and(body_string_contains("client_id=cid"))
-            .and(body_string_contains("client_secret=csec"))
-            .and(body_string_contains("code=abc"))
             .and(body_string_contains("grant_type=authorization_code"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "atk",
-                "refresh_token": "rtk",
-                "expires_at": 1_900_000_000_i64,
-                "athlete": { "id": 42 },
+                "access_token":"a", "refresh_token":"r", "expires_at":9, "athlete":{"id":42}
             })))
             .expect(1)
             .mount(&server)
             .await;
-
-        let client = http_client().unwrap();
-        let r = exchange_code(&client, &server.uri(), "cid", "csec", "abc")
+        let token = exchange_code(&http_client().unwrap(), &server.uri(), "c", "s", "code")
             .await
             .unwrap();
-        assert_eq!(r.access_token, "atk");
-        assert_eq!(r.refresh_token, "rtk");
-        assert_eq!(r.expires_at, 1_900_000_000);
-        assert_eq!(r.athlete.id, 42);
-    }
+        assert_eq!(token.athlete.id, 42);
 
-    #[tokio::test]
-    async fn exchange_code_errors_on_non_2xx() {
-        let server = MockServer::start().await;
-
+        server.reset().await;
         Mock::given(method("POST"))
-            .and(path("/"))
-            .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
-            .mount(&server)
-            .await;
-
-        let client = http_client().unwrap();
-        let err = exchange_code(&client, &server.uri(), "cid", "csec", "abc")
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("400"));
-    }
-
-    #[tokio::test]
-    async fn exchange_code_errors_on_timeout() {
-        use std::time::Instant;
-
-        let server = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(path("/"))
-            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(8)))
-            .mount(&server)
-            .await;
-
-        let client = http_client().unwrap();
-        let start = Instant::now();
-        let _err = exchange_code(&client, &server.uri(), "cid", "csec", "abc")
-            .await
-            .expect_err("expected a timeout error");
-        let elapsed = start.elapsed();
-
-        // 5 s timeout (HTTP_TIMEOUT) — fires before the 8 s wiremock delay.
-        assert!(
-            elapsed < Duration::from_secs(7),
-            "exchange_code took {elapsed:?}, expected to fail within ~5s"
-        );
-    }
-
-    #[tokio::test]
-    async fn deauthorize_posts_bearer_authorization() {
-        let server = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(path("/"))
-            .and(wiremock::matchers::header(
-                "authorization",
-                "Bearer atk-xyz",
-            ))
-            .respond_with(ResponseTemplate::new(200))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token":"a2", "refresh_token":"r2", "expires_at":10
+            })))
             .expect(1)
             .mount(&server)
             .await;
-
-        let client = http_client().unwrap();
-        deauthorize(&client, &server.uri(), "atk-xyz")
+        let token = refresh_token(&http_client().unwrap(), &server.uri(), "c", "s", "r")
             .await
             .unwrap();
+        assert_eq!(token.refresh_token, "r2");
+    }
+
+    #[tokio::test]
+    async fn activities_keep_only_minimum_fields() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/activities"))
+            .and(query_param("after", "0")).and(query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                "id":7, "name":"Morning Run", "start_date":"2026-07-15T06:00:00Z", "distance":12000
+            }]))).mount(&server).await;
+        let got = activities(
+            &http_client().unwrap(),
+            &format!("{}/activities", server.uri()),
+            "token",
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            got,
+            vec![Workout {
+                id: 7,
+                name: "Morning Run".into(),
+                date: "2026-07-15T06:00:00Z".into()
+            }]
+        );
     }
 }

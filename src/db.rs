@@ -1,142 +1,333 @@
-//! MongoDB Atlas access (ADR 001 §4): connection setup + the upsert / cleanup
-//! used by the OAuth callback.
-//!
-//! The Lambda holds one `mongodb::Client` per warm container; it is
-//! constructed in `main.rs` (cold start) and reused for every invocation.
-//! Calls take a `&Client` rather than touching a global, which keeps tests
-//! injectable.
+//! DynamoDB persistence for Strava connections, browser sessions and
+//! short-lived webhook events. Workout data is deliberately not stored here.
 
-use anyhow::Context;
-use bson::{Binary, Bson, doc, spec::BinarySubtype};
-use chrono::{DateTime, TimeZone, Utc};
-use mongodb::Client;
-use mongodb::options::ClientOptions;
+use std::collections::HashMap;
+
+use anyhow::{Context, anyhow};
+use aws_sdk_dynamodb::Client;
+use aws_sdk_dynamodb::primitives::Blob;
+use aws_sdk_dynamodb::types::AttributeValue;
+use sha2::{Digest, Sha256};
 
 use crate::crypto::EncryptedToken;
 
-const DATABASE: &str = "lepre";
-const COLLECTION: &str = "connections";
-const POOL_SIZE: u32 = 5;
+const PK: &str = "pk";
+const SK: &str = "sk";
+const CONNECTION_SK: &str = "CONNECTION";
+const SESSION_SK: &str = "SESSION";
 
-/// Document fields written by `upsert_connection`. Public so integration
-/// tests can read them back.
-pub mod fields {
-    pub const STRAVA_ATHLETE_ID: &str = "strava_athlete_id";
-    pub const CONNECTION_ATTEMPT_ID: &str = "connection_attempt_id";
-    pub const ACCESS_TOKEN_CIPHERTEXT: &str = "access_token_ciphertext";
-    pub const ACCESS_TOKEN_NONCE: &str = "access_token_nonce";
-    pub const REFRESH_TOKEN_CIPHERTEXT: &str = "refresh_token_ciphertext";
-    pub const REFRESH_TOKEN_NONCE: &str = "refresh_token_nonce";
-    pub const KEY_VERSION: &str = "key_version";
-    pub const EXPIRES_AT: &str = "expires_at";
-    pub const CONNECTED_AT: &str = "connected_at";
-    pub const UPDATED_AT: &str = "updated_at";
+#[derive(Clone)]
+pub struct Store {
+    client: Client,
+    table: String,
 }
 
-/// Build a Mongo client with the project-wide pool ceiling.
-pub async fn connect(uri: &str) -> Result<Client, anyhow::Error> {
-    let mut opts = ClientOptions::parse(uri)
-        .await
-        .context("invalid mongodb uri")?;
-    opts.app_name = Some("lepre-api".into());
-    opts.max_pool_size = Some(POOL_SIZE);
-    Ok(Client::with_options(opts)?)
-}
-
-/// What the OAuth callback needs to store.
-pub struct ConnectionUpsert {
-    pub strava_athlete_id: i64,
-    pub connection_attempt_id: String,
+#[derive(Debug, Clone)]
+pub struct Connection {
+    pub athlete_id: i64,
     pub access_token: EncryptedToken,
     pub refresh_token: EncryptedToken,
     pub key_version: i32,
-    pub expires_at_epoch_seconds: i64,
+    pub token_version: i64,
+    pub token_expires_at: i64,
 }
 
-/// Idempotent upsert keyed by `strava_athlete_id`.
-///
-/// First successful connection inserts; a subsequent connection by the same
-/// athlete replaces the encrypted token fields. `connected_at` is preserved
-/// across re-connections; `updated_at` is set to `now` every time.
-pub async fn upsert_connection(
-    client: &Client,
-    upsert: &ConnectionUpsert,
-    now: DateTime<Utc>,
-) -> Result<(), anyhow::Error> {
-    let coll = client
-        .database(DATABASE)
-        .collection::<bson::Document>(COLLECTION);
-
-    let expires_at = Utc
-        .timestamp_opt(upsert.expires_at_epoch_seconds, 0)
-        .single()
-        .ok_or_else(|| anyhow::anyhow!("invalid expires_at epoch"))?;
-
-    let set_doc = doc! {
-        fields::STRAVA_ATHLETE_ID: upsert.strava_athlete_id,
-        fields::CONNECTION_ATTEMPT_ID: &upsert.connection_attempt_id,
-        fields::ACCESS_TOKEN_CIPHERTEXT: bin(&upsert.access_token.ciphertext),
-        fields::ACCESS_TOKEN_NONCE: bin(&upsert.access_token.nonce),
-        fields::REFRESH_TOKEN_CIPHERTEXT: bin(&upsert.refresh_token.ciphertext),
-        fields::REFRESH_TOKEN_NONCE: bin(&upsert.refresh_token.nonce),
-        fields::KEY_VERSION: upsert.key_version,
-        fields::EXPIRES_AT: bson::DateTime::from_chrono(expires_at),
-        fields::UPDATED_AT: bson::DateTime::from_chrono(now),
-    };
-    let on_insert_doc = doc! {
-        fields::CONNECTED_AT: bson::DateTime::from_chrono(now),
-    };
-
-    coll.update_one(
-        doc! { fields::STRAVA_ATHLETE_ID: upsert.strava_athlete_id },
-        doc! { "$set": set_doc, "$setOnInsert": on_insert_doc },
-    )
-    .upsert(true)
-    .await
-    .context("mongo upsert failed")?;
-
-    Ok(())
+#[derive(Debug, Clone)]
+pub struct WebhookEvent {
+    pub object_id: i64,
+    pub aspect_type: String,
 }
 
-/// Cleanup any partial document written under `connection_attempt_id` —
-/// used after a write failure where `replace_one` may have succeeded
-/// server-side before the client saw the error.
-pub async fn delete_attempt(
-    client: &Client,
-    connection_attempt_id: &str,
-) -> Result<(), anyhow::Error> {
-    let coll = client
-        .database(DATABASE)
-        .collection::<bson::Document>(COLLECTION);
-    coll.delete_one(doc! { fields::CONNECTION_ATTEMPT_ID: connection_attempt_id })
-        .await
-        .context("mongo cleanup delete failed")?;
-    Ok(())
+impl Store {
+    pub fn new(client: Client, table: String) -> Self {
+        Self { client, table }
+    }
+
+    pub async fn put_connection(&self, connection: &Connection) -> Result<(), anyhow::Error> {
+        self.client
+            .put_item()
+            .table_name(&self.table)
+            .set_item(Some(connection_item(connection)))
+            .send()
+            .await
+            .context("dynamodb put connection failed")?;
+        Ok(())
+    }
+
+    pub async fn get_connection(
+        &self,
+        athlete_id: i64,
+    ) -> Result<Option<Connection>, anyhow::Error> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(&self.table)
+            .key(PK, AttributeValue::S(athlete_pk(athlete_id)))
+            .key(SK, AttributeValue::S(CONNECTION_SK.to_owned()))
+            .consistent_read(true)
+            .send()
+            .await
+            .context("dynamodb get connection failed")?;
+        response.item().map(parse_connection).transpose()
+    }
+
+    pub async fn replace_tokens(
+        &self,
+        connection: &Connection,
+        expected_version: i64,
+    ) -> Result<bool, anyhow::Error> {
+        let result = self
+            .client
+            .put_item()
+            .table_name(&self.table)
+            .set_item(Some(connection_item(connection)))
+            .condition_expression("token_version = :expected")
+            .expression_attribute_values(
+                ":expected",
+                AttributeValue::N(expected_version.to_string()),
+            )
+            .send()
+            .await;
+        match result {
+            Ok(_) => Ok(true),
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(|e| e.is_conditional_check_failed_exception()) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error).context("dynamodb token update failed"),
+        }
+    }
+
+    pub async fn delete_connection(&self, athlete_id: i64) -> Result<(), anyhow::Error> {
+        self.client
+            .delete_item()
+            .table_name(&self.table)
+            .key(PK, AttributeValue::S(athlete_pk(athlete_id)))
+            .key(SK, AttributeValue::S(CONNECTION_SK.to_owned()))
+            .send()
+            .await
+            .context("dynamodb delete connection failed")?;
+        Ok(())
+    }
+
+    pub async fn create_session(
+        &self,
+        raw_session: &str,
+        athlete_id: i64,
+        expires_at: i64,
+    ) -> Result<(), anyhow::Error> {
+        self.client
+            .put_item()
+            .table_name(&self.table)
+            .item(PK, AttributeValue::S(session_pk(raw_session)))
+            .item(SK, AttributeValue::S(SESSION_SK.to_owned()))
+            .item("athlete_id", AttributeValue::N(athlete_id.to_string()))
+            .item("expires_at", AttributeValue::N(expires_at.to_string()))
+            .send()
+            .await
+            .context("dynamodb put session failed")?;
+        Ok(())
+    }
+
+    pub async fn athlete_for_session(
+        &self,
+        raw_session: &str,
+        now: i64,
+    ) -> Result<Option<i64>, anyhow::Error> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(&self.table)
+            .key(PK, AttributeValue::S(session_pk(raw_session)))
+            .key(SK, AttributeValue::S(SESSION_SK.to_owned()))
+            .consistent_read(true)
+            .send()
+            .await
+            .context("dynamodb get session failed")?;
+        let Some(item) = response.item() else {
+            return Ok(None);
+        };
+        let expires = n(item, "expires_at")?;
+        if expires <= now {
+            return Ok(None);
+        }
+        Ok(Some(n(item, "athlete_id")?))
+    }
+
+    pub async fn delete_session(&self, raw_session: &str) -> Result<(), anyhow::Error> {
+        self.client
+            .delete_item()
+            .table_name(&self.table)
+            .key(PK, AttributeValue::S(session_pk(raw_session)))
+            .key(SK, AttributeValue::S(SESSION_SK.to_owned()))
+            .send()
+            .await
+            .context("dynamodb delete session failed")?;
+        Ok(())
+    }
+
+    pub async fn put_webhook_event(
+        &self,
+        athlete_id: i64,
+        object_id: i64,
+        aspect_type: &str,
+        received_at_ms: i64,
+    ) -> Result<(), anyhow::Error> {
+        let suffix = uuid::Uuid::new_v4();
+        self.client
+            .put_item()
+            .table_name(&self.table)
+            .item(PK, AttributeValue::S(athlete_pk(athlete_id)))
+            .item(
+                SK,
+                AttributeValue::S(format!("EVENT#{received_at_ms:020}#{suffix}")),
+            )
+            .item("object_id", AttributeValue::N(object_id.to_string()))
+            .item("aspect_type", AttributeValue::S(aspect_type.to_owned()))
+            .item(
+                "expires_at",
+                AttributeValue::N((received_at_ms / 1000 + 2_592_000).to_string()),
+            )
+            .send()
+            .await
+            .context("dynamodb put webhook event failed")?;
+        Ok(())
+    }
+
+    pub async fn webhook_events(
+        &self,
+        athlete_id: i64,
+        after_ms: i64,
+        through_ms: i64,
+    ) -> Result<Vec<WebhookEvent>, anyhow::Error> {
+        let response = self
+            .client
+            .query()
+            .table_name(&self.table)
+            .key_condition_expression("pk = :pk AND sk BETWEEN :after AND :through")
+            .expression_attribute_values(":pk", AttributeValue::S(athlete_pk(athlete_id)))
+            .expression_attribute_values(
+                ":after",
+                AttributeValue::S(format!("EVENT#{after_ms:020}")),
+            )
+            .expression_attribute_values(
+                ":through",
+                AttributeValue::S(format!("EVENT#{through_ms:020}~")),
+            )
+            .consistent_read(true)
+            .send()
+            .await
+            .context("dynamodb query webhook events failed")?;
+        response
+            .items()
+            .iter()
+            .map(|item| {
+                Ok(WebhookEvent {
+                    object_id: n(item, "object_id")?,
+                    aspect_type: s(item, "aspect_type")?.to_owned(),
+                })
+            })
+            .collect()
+    }
 }
 
-/// Ensure the unique index on `{ strava_athlete_id: 1 }` exists. Called once
-/// at cold start; idempotent.
-pub async fn ensure_indexes(client: &Client) -> Result<(), anyhow::Error> {
-    use mongodb::IndexModel;
-    use mongodb::options::IndexOptions;
-
-    let index = IndexModel::builder()
-        .keys(doc! { fields::STRAVA_ATHLETE_ID: 1 })
-        .options(IndexOptions::builder().unique(true).build())
-        .build();
-
-    client
-        .database(DATABASE)
-        .collection::<bson::Document>(COLLECTION)
-        .create_index(index)
-        .await
-        .context("mongo create_index failed")?;
-    Ok(())
+fn athlete_pk(athlete_id: i64) -> String {
+    format!("ATHLETE#{athlete_id}")
 }
 
-fn bin(bytes: &[u8]) -> Bson {
-    Bson::Binary(Binary {
-        subtype: BinarySubtype::Generic,
-        bytes: bytes.to_vec(),
+fn session_pk(raw_session: &str) -> String {
+    let digest = Sha256::digest(raw_session.as_bytes());
+    format!("SESSION#{digest:x}")
+}
+
+fn connection_item(connection: &Connection) -> HashMap<String, AttributeValue> {
+    HashMap::from([
+        (
+            PK.to_owned(),
+            AttributeValue::S(athlete_pk(connection.athlete_id)),
+        ),
+        (SK.to_owned(), AttributeValue::S(CONNECTION_SK.to_owned())),
+        (
+            "athlete_id".to_owned(),
+            AttributeValue::N(connection.athlete_id.to_string()),
+        ),
+        (
+            "access_ciphertext".to_owned(),
+            AttributeValue::B(Blob::new(connection.access_token.ciphertext.clone())),
+        ),
+        (
+            "access_nonce".to_owned(),
+            AttributeValue::B(Blob::new(connection.access_token.nonce)),
+        ),
+        (
+            "refresh_ciphertext".to_owned(),
+            AttributeValue::B(Blob::new(connection.refresh_token.ciphertext.clone())),
+        ),
+        (
+            "refresh_nonce".to_owned(),
+            AttributeValue::B(Blob::new(connection.refresh_token.nonce)),
+        ),
+        (
+            "key_version".to_owned(),
+            AttributeValue::N(connection.key_version.to_string()),
+        ),
+        (
+            "token_version".to_owned(),
+            AttributeValue::N(connection.token_version.to_string()),
+        ),
+        (
+            "token_expires_at".to_owned(),
+            AttributeValue::N(connection.token_expires_at.to_string()),
+        ),
+    ])
+}
+
+fn parse_connection(item: &HashMap<String, AttributeValue>) -> Result<Connection, anyhow::Error> {
+    Ok(Connection {
+        athlete_id: n(item, "athlete_id")?,
+        access_token: encrypted(item, "access_ciphertext", "access_nonce")?,
+        refresh_token: encrypted(item, "refresh_ciphertext", "refresh_nonce")?,
+        key_version: n(item, "key_version")? as i32,
+        token_version: n(item, "token_version")?,
+        token_expires_at: n(item, "token_expires_at")?,
     })
+}
+
+fn encrypted(
+    item: &HashMap<String, AttributeValue>,
+    ciphertext: &str,
+    nonce: &str,
+) -> Result<EncryptedToken, anyhow::Error> {
+    let ciphertext = item
+        .get(ciphertext)
+        .and_then(|v| v.as_b().ok())
+        .ok_or_else(|| anyhow!("missing ciphertext"))?
+        .as_ref()
+        .to_vec();
+    let nonce_vec = item
+        .get(nonce)
+        .and_then(|v| v.as_b().ok())
+        .ok_or_else(|| anyhow!("missing nonce"))?
+        .as_ref()
+        .to_vec();
+    let nonce = nonce_vec.try_into().map_err(|_| anyhow!("invalid nonce"))?;
+    Ok(EncryptedToken { ciphertext, nonce })
+}
+
+fn s<'a>(item: &'a HashMap<String, AttributeValue>, key: &str) -> Result<&'a str, anyhow::Error> {
+    item.get(key)
+        .and_then(|v| v.as_s().ok())
+        .map(String::as_str)
+        .ok_or_else(|| anyhow!("missing string field {key}"))
+}
+
+fn n(item: &HashMap<String, AttributeValue>, key: &str) -> Result<i64, anyhow::Error> {
+    item.get(key)
+        .and_then(|value| value.as_n().ok())
+        .ok_or_else(|| anyhow!("missing numeric field {key}"))?
+        .parse()
+        .with_context(|| format!("invalid numeric field {key}"))
 }

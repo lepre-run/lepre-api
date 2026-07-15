@@ -1,11 +1,6 @@
 //! `lepre-api` Lambda entrypoint.
 //!
-//! Three routes (per ADR 001 §1):
-//! - `GET /v1/healthz`
-//! - `GET /v1/auth/strava/start`
-//! - `GET /v1/auth/strava/callback`
-//!
-//! Anything else → `404 not_found`.
+//! Lambda entry point for the local-first application's thin backend.
 
 use std::sync::Arc;
 
@@ -18,20 +13,23 @@ async fn main() -> Result<(), Error> {
         .json()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,mongodb=warn,reqwest=warn,hyper=warn,h2=warn".into()),
+                .unwrap_or_else(|_| "info,aws_sdk=warn,reqwest=warn,hyper=warn,h2=warn".into()),
         )
         .with_target(false)
         .with_current_span(false)
         .init();
 
     let config = config::Config::load_from_ssm().await?;
-    let mongo_client = db::connect(&config.mongodb_uri).await?;
-    db::ensure_indexes(&mongo_client).await?;
+    let aws = aws_config::load_from_env().await;
+    let store = db::Store::new(
+        aws_sdk_dynamodb::Client::new(&aws),
+        config.table_name.clone(),
+    );
     let http_client = strava::http_client()?;
 
     let ctx = Arc::new(handler::Ctx {
         config,
-        mongo_client,
+        store,
         http_client,
     });
 

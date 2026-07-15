@@ -1,6 +1,6 @@
 //! Lambda runtime configuration loaded once on cold start (ADR 001 §5).
 //!
-//! All four secrets live under `/lepre/api/*` in SSM SecureString. A single
+//! Secrets live under `/lepre/api/*` in SSM SecureString. A single
 //! `GetParameters` batch call populates the struct; subsequent invocations
 //! of the warm Lambda re-use the cached values without further SSM
 //! round-trips.
@@ -13,8 +13,8 @@ use base64::Engine as _;
 const SSM_NAMES: &[&str] = &[
     "/lepre/api/strava_client_id",
     "/lepre/api/strava_client_secret",
-    "/lepre/api/mongodb_uri",
     "/lepre/api/token_encryption_key",
+    "/lepre/api/webhook_verify_token",
 ];
 
 /// Resolved configuration values. Constructed once; never mutated.
@@ -22,7 +22,8 @@ const SSM_NAMES: &[&str] = &[
 pub struct Config {
     pub strava_client_id: String,
     pub strava_client_secret: String,
-    pub mongodb_uri: String,
+    pub webhook_verify_token: String,
+    pub table_name: String,
     /// 32-byte AES-256 key, decoded from the base64 SSM value.
     pub token_encryption_key: [u8; 32],
     pub key_version: i32,
@@ -42,7 +43,10 @@ impl Config {
             .await
             .context("ssm:GetParameters failed")?;
 
-        if let Some(invalid) = resp.invalid_parameters().first() {
+        if let Some(invalid) = resp.invalid_parameters().iter().find(|name| {
+            name.as_str() != "/lepre/api/strava_client_id"
+                && name.as_str() != "/lepre/api/strava_client_secret"
+        }) {
             return Err(anyhow!(
                 "ssm parameter not found: {invalid} (expected one of: {names})",
                 names = SSM_NAMES.join(", "),
@@ -63,15 +67,20 @@ impl Config {
     }
 
     fn from_values(values: &mut HashMap<String, String>) -> Result<Self, anyhow::Error> {
+        let strava_client_id = values
+            .remove("/lepre/api/strava_client_id")
+            .unwrap_or_default();
+        let strava_client_secret = values
+            .remove("/lepre/api/strava_client_secret")
+            .unwrap_or_default();
+
         let mut take = |k: &str| -> Result<String, anyhow::Error> {
             values
                 .remove(k)
                 .ok_or_else(|| anyhow!("missing ssm parameter: {k}"))
         };
 
-        let strava_client_id = take("/lepre/api/strava_client_id")?;
-        let strava_client_secret = take("/lepre/api/strava_client_secret")?;
-        let mongodb_uri = take("/lepre/api/mongodb_uri")?;
+        let webhook_verify_token = take("/lepre/api/webhook_verify_token")?;
         let key_b64 = take("/lepre/api/token_encryption_key")?;
 
         let key_bytes = base64::engine::general_purpose::STANDARD
@@ -84,10 +93,15 @@ impl Config {
         Ok(Self {
             strava_client_id,
             strava_client_secret,
-            mongodb_uri,
+            webhook_verify_token,
+            table_name: std::env::var("LEPRE_TABLE_NAME").unwrap_or_else(|_| "lepre".to_owned()),
             token_encryption_key,
             key_version: 1,
         })
+    }
+
+    pub fn strava_configured(&self) -> bool {
+        !self.strava_client_id.is_empty() && !self.strava_client_secret.is_empty()
     }
 }
 
@@ -105,13 +119,13 @@ mod tests {
         let mut h = HashMap::new();
         h.insert("/lepre/api/strava_client_id".into(), "clid".into());
         h.insert("/lepre/api/strava_client_secret".into(), "csec".into());
-        h.insert("/lepre/api/mongodb_uri".into(), "mongodb+srv://x".into());
         h.insert("/lepre/api/token_encryption_key".into(), b64_32());
+        h.insert("/lepre/api/webhook_verify_token".into(), "verify".into());
 
         let cfg = Config::from_values(&mut h).unwrap();
         assert_eq!(cfg.strava_client_id, "clid");
         assert_eq!(cfg.strava_client_secret, "csec");
-        assert_eq!(cfg.mongodb_uri, "mongodb+srv://x");
+        assert_eq!(cfg.webhook_verify_token, "verify");
         assert_eq!(cfg.token_encryption_key, [7u8; 32]);
         assert_eq!(cfg.key_version, 1);
     }
@@ -137,6 +151,7 @@ mod tests {
             "/lepre/api/token_encryption_key".into(),
             base64::engine::general_purpose::STANDARD.encode([1u8; 16]),
         );
+        h.insert("/lepre/api/webhook_verify_token".into(), "verify".into());
         let err = Config::from_values(&mut h).unwrap_err();
         assert!(
             err.to_string().contains("32 bytes"),

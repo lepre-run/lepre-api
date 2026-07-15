@@ -80,10 +80,6 @@ pub fn encrypt(
 ///
 /// Slice 1 only encrypts (no token refresh, no read-back); decryption is
 /// here for symmetry and tests, and so slice 2 has a stable surface to call.
-#[allow(
-    dead_code,
-    reason = "slice 1 writes only; slice 2 will read for token refresh"
-)]
 pub fn decrypt(
     et: &EncryptedToken,
     athlete_id: i64,
