@@ -34,7 +34,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 [dependencies.aws-config]
 version = "1"
 default-features = false
-features = ["behavior-version-latest", "rustls"]
+features = ["behavior-version-latest", "rt-tokio", "rustls"]
 
 [dependencies.aws-sdk-ssm]
 version = "1"
