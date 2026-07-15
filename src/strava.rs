@@ -106,28 +106,28 @@ pub async fn refresh_token(
     .await
 }
 
-pub async fn activities(
+pub async fn activities_page(
     client: &reqwest::Client,
     base_url: &str,
     access_token: &str,
     after: i64,
+    before: i64,
+    page: i64,
 ) -> Result<Vec<Workout>, anyhow::Error> {
-    let mut workouts = Vec::new();
-    for page in 1..=30 {
-        let response = client
+    checked_json(
+        client
             .get(base_url)
             .bearer_auth(access_token)
-            .query(&[("after", after), ("page", page), ("per_page", 200)])
+            .query(&[
+                ("after", after),
+                ("before", before),
+                ("page", page),
+                ("per_page", 200),
+            ])
             .send()
-            .await?;
-        let batch: Vec<Workout> = checked_json(response).await?;
-        let done = batch.len() < 200;
-        workouts.extend(batch);
-        if done {
-            return Ok(workouts);
-        }
-    }
-    anyhow::bail!("activity import exceeded 6000 activities")
+            .await?,
+    )
+    .await
 }
 
 pub async fn activity(
@@ -229,14 +229,17 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET")).and(path("/activities"))
             .and(query_param("after", "0")).and(query_param("page", "1"))
+            .and(query_param("before", "1800000000"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([{
                 "id":7, "name":"Morning Run", "start_date":"2026-07-15T06:00:00Z", "distance":12000
             }]))).mount(&server).await;
-        let got = activities(
+        let got = activities_page(
             &http_client().unwrap(),
             &format!("{}/activities", server.uri()),
             "token",
             0,
+            1_800_000_000,
+            1,
         )
         .await
         .unwrap();

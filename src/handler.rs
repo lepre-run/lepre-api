@@ -173,6 +173,8 @@ async fn session(req: &Request, ctx: &Ctx) -> Response<Body> {
 struct SyncQuery {
     after: Option<i64>,
     cursor: Option<i64>,
+    snapshot: Option<i64>,
+    page: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -182,6 +184,8 @@ struct SyncResponse {
     deleted_ids: Vec<i64>,
     synced_at: i64,
     cursor: i64,
+    snapshot: i64,
+    next_page: Option<i64>,
 }
 
 async fn workouts(req: &Request, ctx: &Ctx) -> Response<Body> {
@@ -197,31 +201,56 @@ async fn workouts(req: &Request, ctx: &Ctx) -> Response<Body> {
     };
     let query: SyncQuery =
         serde_urlencoded::from_str(req.uri().query().unwrap_or("")).unwrap_or_default();
+    let Some(page) = query.page else {
+        return json(
+            StatusCode::BAD_REQUEST,
+            &serde_json::json!({"error":"paged_sync_required"}),
+        );
+    };
+    if !(1..=30).contains(&page) {
+        return json(
+            StatusCode::BAD_REQUEST,
+            &serde_json::json!({"error":"invalid_sync_page"}),
+        );
+    }
     let after = query.after.unwrap_or(0).max(0);
     let event_cursor = query.cursor.unwrap_or(0).max(0);
-    let snapshot_ms = now_millis();
+    let snapshot_ms = query.snapshot.unwrap_or_else(now_millis).max(1);
+    // Strava's `before` parameter is in seconds. Adding one keeps activities
+    // created during the snapshot second inside this stable import window.
+    let before = snapshot_ms / 1000 + 1;
     let access_token = match valid_access_token(ctx, athlete_id).await {
         Ok(token) => token,
         Err(error) => return internal(error),
     };
-    let mut workouts = match strava::activities(
+    let mut workouts = match strava::activities_page(
         &ctx.http_client,
         strava::activities_url(),
         &access_token,
         after,
+        before,
+        page,
     )
     .await
     {
         Ok(workouts) => workouts,
         Err(error) => return upstream(error),
     };
-    let events = match ctx
-        .store
-        .webhook_events(athlete_id, event_cursor, snapshot_ms)
-        .await
-    {
-        Ok(events) => events,
-        Err(error) => return internal(error),
+    let has_more = workouts.len() == 200;
+    if has_more && page == 30 {
+        return upstream(anyhow::anyhow!("activity import exceeded 6000 activities"));
+    }
+    let events = if has_more {
+        Vec::new()
+    } else {
+        match ctx
+            .store
+            .webhook_events(athlete_id, event_cursor, snapshot_ms)
+            .await
+        {
+            Ok(events) => events,
+            Err(error) => return internal(error),
+        }
     };
     let mut deleted = HashSet::new();
     let present: HashSet<i64> = workouts.iter().map(|workout| workout.id).collect();
@@ -256,6 +285,8 @@ async fn workouts(req: &Request, ctx: &Ctx) -> Response<Body> {
             deleted_ids: deleted.into_iter().collect(),
             synced_at: snapshot_ms / 1000,
             cursor: snapshot_ms,
+            snapshot: snapshot_ms,
+            next_page: has_more.then_some(page + 1),
         },
     )
 }
