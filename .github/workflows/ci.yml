@@ -61,7 +61,7 @@ jobs:
           aws-region: eu-west-1
 
       - name: Build Lambda binary (arm64)
-        run: cargo lambda build --release --arm64
+        run: cargo lambda build --release --arm64 --output-format zip
 
       - name: Update Lambda function code
         run: |
