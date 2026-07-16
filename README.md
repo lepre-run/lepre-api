@@ -14,9 +14,12 @@ Routes:
 - `POST /v1/disconnect`
 - `GET|POST /v1/webhooks/strava`
 
-`GET /v1/workouts` returns synchronization batches containing the provider-
-independent workout entity: id, performed time, name, moving-duration seconds
-and distance meters. It never persists those workouts.
+`GET /v1/workouts` returns newest-first synchronization batches containing
+detailed `Run`, `TrailRun`, and `VirtualRun` activities. The initial window is
+one year and can be changed with `historyDays`. Each activity includes the
+selected original fields Lepre needs: identity, date, name, public description,
+sport, moving and elapsed duration, distance, and laps. The Lambda fetches this
+content transiently from Strava and never persists or classifies it.
 
 Code follows the Clean Architecture dependency rule:
 

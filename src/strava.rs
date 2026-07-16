@@ -5,12 +5,13 @@ use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
+use futures::{StreamExt, TryStreamExt, stream};
 use serde::{Deserialize, Serialize};
 
 use crate::application::{
-    AuthorizedProviderAccount, Provider, ProviderCredentials, ProviderProfile,
+    AuthorizedProviderAccount, Provider, ProviderCredentials, ProviderProfile, ProviderWorkoutPage,
 };
-use crate::domain::{ExternalAccountId, Workout, WorkoutId};
+use crate::domain::{ExternalAccountId, Lap, RunSport, Workout, WorkoutData, WorkoutId};
 
 const AUTHORIZE_URL: &str = "https://www.strava.com/oauth/authorize";
 const TOKEN_URL: &str = "https://www.strava.com/oauth/token";
@@ -21,6 +22,8 @@ const ACTIVITY_URL: &str = "https://www.strava.com/api/v3/activities";
 const REDIRECT_URI: &str = "https://api.lepre.run/v1/auth/strava/callback";
 const REQUIRED_SCOPES: &[&str] = &["read", "activity:read_all"];
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+const ACTIVITY_PAGE_SIZE: i64 = 10;
+const DETAIL_CONCURRENCY: usize = 4;
 
 #[derive(Clone)]
 pub struct StravaProvider {
@@ -140,23 +143,74 @@ struct AthleteDto {
 }
 
 #[derive(Deserialize)]
-struct ActivityDto {
+struct SummaryActivityDto {
+    id: i64,
+    sport_type: String,
+}
+
+#[derive(Deserialize)]
+struct DetailedActivityDto {
     id: i64,
     name: String,
+    #[serde(default)]
+    description: Option<String>,
+    sport_type: String,
     start_date: String,
     moving_time: i64,
+    elapsed_time: i64,
+    distance: f64,
+    #[serde(default)]
+    laps: Vec<LapDto>,
+}
+
+#[derive(Deserialize)]
+struct LapDto {
+    lap_index: i64,
+    name: String,
+    moving_time: i64,
+    elapsed_time: i64,
     distance: f64,
 }
 
-impl ActivityDto {
-    fn into_domain(self) -> Result<Workout, anyhow::Error> {
-        Ok(Workout::new(
-            WorkoutId::new(format!("strava:{}", self.id))?,
-            self.start_date,
-            self.name,
-            self.moving_time,
-            self.distance,
-        )?)
+fn run_sport(value: &str) -> Option<RunSport> {
+    match value {
+        "Run" => Some(RunSport::Run),
+        "TrailRun" => Some(RunSport::TrailRun),
+        "VirtualRun" => Some(RunSport::VirtualRun),
+        _ => None,
+    }
+}
+
+impl DetailedActivityDto {
+    fn into_domain(self) -> Result<Option<Workout>, anyhow::Error> {
+        let Some(sport) = run_sport(&self.sport_type) else {
+            return Ok(None);
+        };
+        let laps = self
+            .laps
+            .into_iter()
+            .map(|lap| {
+                Lap::new(
+                    lap.lap_index,
+                    lap.name,
+                    lap.moving_time,
+                    lap.elapsed_time,
+                    lap.distance,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Workout::new(WorkoutData {
+            id: WorkoutId::new(format!("strava:{}", self.id))?,
+            performed_at: self.start_date,
+            name: self.name,
+            description: self.description.unwrap_or_default(),
+            sport,
+            duration_seconds: self.moving_time,
+            elapsed_duration_seconds: self.elapsed_time,
+            distance_meters: self.distance,
+            laps,
+        })?
+        .into())
     }
 }
 
@@ -247,8 +301,8 @@ impl Provider for StravaProvider {
         after: i64,
         before: i64,
         page: i64,
-    ) -> Result<Vec<Workout>, anyhow::Error> {
-        let activities: Vec<ActivityDto> = checked_json(
+    ) -> Result<ProviderWorkoutPage, anyhow::Error> {
+        let activities: Vec<SummaryActivityDto> = checked_json(
             self.client
                 .get(&self.endpoints.activities)
                 .bearer_auth(access_token)
@@ -256,16 +310,26 @@ impl Provider for StravaProvider {
                     ("after", after),
                     ("before", before),
                     ("page", page),
-                    ("per_page", 200),
+                    ("per_page", ACTIVITY_PAGE_SIZE),
                 ])
                 .send()
                 .await?,
         )
         .await?;
-        activities
+        let has_more = activities.len() == ACTIVITY_PAGE_SIZE as usize;
+        let ids = activities
             .into_iter()
-            .map(ActivityDto::into_domain)
-            .collect()
+            .filter(|activity| run_sport(&activity.sport_type).is_some())
+            .map(|activity| activity.id);
+        let workouts = stream::iter(ids)
+            .map(|id| async move { self.detailed_workout(access_token, id).await })
+            .buffered(DETAIL_CONCURRENCY)
+            .try_collect::<Vec<Option<Workout>>>()
+            .await?
+            .into_iter()
+            .flatten()
+            .collect();
+        Ok(ProviderWorkoutPage { workouts, has_more })
     }
 
     async fn workout(
@@ -273,17 +337,8 @@ impl Provider for StravaProvider {
         access_token: &str,
         external_workout_id: i64,
     ) -> Result<Option<Workout>, anyhow::Error> {
-        let response = self
-            .client
-            .get(format!("{}/{external_workout_id}", self.endpoints.activity))
-            .bearer_auth(access_token)
-            .send()
-            .await?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        let activity: ActivityDto = checked_json(response).await?;
-        Ok(Some(activity.into_domain()?))
+        self.detailed_workout(access_token, external_workout_id)
+            .await
     }
 
     async fn deauthorize(&self, access_token: &str) -> Result<(), anyhow::Error> {
@@ -297,6 +352,27 @@ impl Provider for StravaProvider {
             anyhow::bail!("Strava deauthorization returned {}", response.status())
         }
         Ok(())
+    }
+}
+
+impl StravaProvider {
+    async fn detailed_workout(
+        &self,
+        access_token: &str,
+        external_workout_id: i64,
+    ) -> Result<Option<Workout>, anyhow::Error> {
+        let response = self
+            .client
+            .get(format!("{}/{external_workout_id}", self.endpoints.activity))
+            .bearer_auth(access_token)
+            .query(&[("include_all_efforts", false)])
+            .send()
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let activity: DetailedActivityDto = checked_json(response).await?;
+        activity.into_domain()
     }
 }
 
@@ -346,7 +422,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn activities_map_seconds_and_meters_into_domain() {
+    async fn running_activities_include_descriptions_and_laps() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/activities"))
@@ -354,18 +430,53 @@ mod tests {
             .and(query_param("page", "1"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(serde_json::json!([{
-                    "id":7, "name":"Morning Run", "start_date":"2026-07-15T06:00:00Z",
-                    "moving_time":3600, "distance":10050.5
+                    "id":7, "sport_type":"Run"
                 }])),
             )
             .mount(&server)
             .await;
-        let workouts = StravaProvider::with_base_url(&server.uri())
+        Mock::given(method("GET"))
+            .and(path("/activity/7"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id":7, "name":"Morning Run", "description":"Track session",
+                "sport_type":"Run", "start_date":"2026-07-15T06:00:00Z",
+                "moving_time":3600, "elapsed_time":3700, "distance":10050.5,
+                "laps":[{
+                    "lap_index":1, "name":"Lap 1", "moving_time":3600,
+                    "elapsed_time":3700, "distance":10050.5
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let page = StravaProvider::with_base_url(&server.uri())
             .workouts("token", 0, 1_800_000_000, 1)
             .await
             .unwrap();
+        let workouts = page.workouts;
         assert_eq!(workouts[0].id.as_str(), "strava:7");
         assert_eq!(workouts[0].duration_seconds, 3600);
         assert_eq!(workouts[0].distance_meters, 10050.5);
+        assert_eq!(workouts[0].description, "Track session");
+        assert_eq!(workouts[0].laps[0].index, 1);
+        assert!(!page.has_more);
+    }
+
+    #[tokio::test]
+    async fn non_running_activities_are_not_detailed_or_returned() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/activities"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "id":8, "sport_type":"Ride"
+                }])),
+            )
+            .mount(&server)
+            .await;
+        let page = StravaProvider::with_base_url(&server.uri())
+            .workouts("token", 0, 1_800_000_000, 1)
+            .await
+            .unwrap();
+        assert!(page.workouts.is_empty());
     }
 }

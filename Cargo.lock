@@ -1488,6 +1488,7 @@ dependencies = [
  "aws-sdk-dynamodb",
  "aws-sdk-ssm",
  "base64",
+ "futures",
  "http 1.4.0",
  "lambda_http",
  "percent-encoding",

@@ -14,7 +14,7 @@ use crate::domain::{
 };
 
 const SESSION_SECONDS: i64 = 30 * 24 * 60 * 60;
-const MAX_SYNC_PAGES: i64 = 30;
+const MAX_SYNC_PAGES: i64 = 1_000;
 
 #[derive(Debug, Clone)]
 pub struct ProviderCredentials {
@@ -43,6 +43,12 @@ pub struct AuthorizedProviderAccount {
 pub struct ProviderProfile {
     pub first_name: String,
     pub last_name: String,
+}
+
+#[derive(Debug)]
+pub struct ProviderWorkoutPage {
+    pub workouts: Vec<Workout>,
+    pub has_more: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -151,7 +157,7 @@ pub trait Provider: Send + Sync {
         after: i64,
         before: i64,
         page: i64,
-    ) -> Result<Vec<Workout>, anyhow::Error>;
+    ) -> Result<ProviderWorkoutPage, anyhow::Error>;
     async fn workout(
         &self,
         access_token: &str,
@@ -286,12 +292,13 @@ impl Application {
         let connection = self.connection(&user_id).await?;
         let access_token = self.valid_access_token(connection, now_seconds).await?;
         let before = request.snapshot_millis / 1000 + 1;
-        let mut workouts = self
+        let page = self
             .provider
             .workouts(&access_token, request.after_seconds, before, request.page)
             .await
             .map_err(ApplicationError::Provider)?;
-        let has_more = workouts.len() == 200;
+        let mut workouts = page.workouts;
+        let has_more = page.has_more;
         if has_more && request.page == MAX_SYNC_PAGES {
             return Err(ApplicationError::InvalidSynchronization);
         }

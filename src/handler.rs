@@ -23,6 +23,8 @@ use crate::domain::{ExternalAccountId, User, Workout};
 use crate::{headers, redirect};
 
 const APP_ORIGIN: &str = "https://lepre.run";
+const DEFAULT_HISTORY_DAYS: i64 = 365;
+const MAX_HISTORY_DAYS: i64 = 3_650;
 
 pub struct Ctx {
     pub config: Config,
@@ -258,9 +260,11 @@ struct CallbackQuery {
 }
 
 #[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SyncQuery {
     checkpoint: Option<String>,
     continuation: Option<String>,
+    history_days: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -281,6 +285,10 @@ struct ContinuationToken {
 
 fn sync_request(query: &str, snapshot_millis: i64) -> Result<SyncRequest, anyhow::Error> {
     let query: SyncQuery = serde_urlencoded::from_str(query)?;
+    let history_days = query.history_days.unwrap_or(DEFAULT_HISTORY_DAYS);
+    if !(1..=MAX_HISTORY_DAYS).contains(&history_days) {
+        anyhow::bail!("invalid history window");
+    }
     match (query.checkpoint, query.continuation) {
         (Some(_), Some(_)) => anyhow::bail!("checkpoint and continuation are mutually exclusive"),
         (_, Some(value)) => {
@@ -302,7 +310,9 @@ fn sync_request(query: &str, snapshot_millis: i64) -> Result<SyncRequest, anyhow
             })
         }
         (None, None) => Ok(SyncRequest {
-            after_seconds: 0,
+            after_seconds: (snapshot_millis / 1000)
+                .saturating_sub(history_days * 24 * 60 * 60)
+                .max(0),
             event_cursor_millis: 0,
             snapshot_millis,
             page: 1,
@@ -356,7 +366,21 @@ struct WorkoutResponse {
     id: String,
     performed_at: String,
     name: String,
+    description: String,
+    sport: &'static str,
     duration_seconds: i64,
+    elapsed_duration_seconds: i64,
+    distance_meters: f64,
+    laps: Vec<LapResponse>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LapResponse {
+    index: i64,
+    name: String,
+    moving_duration_seconds: i64,
+    elapsed_duration_seconds: i64,
     distance_meters: f64,
 }
 
@@ -366,8 +390,22 @@ impl From<Workout> for WorkoutResponse {
             id: workout.id.to_string(),
             performed_at: workout.performed_at,
             name: workout.name,
+            description: workout.description,
+            sport: workout.sport.as_str(),
             duration_seconds: workout.duration_seconds,
+            elapsed_duration_seconds: workout.elapsed_duration_seconds,
             distance_meters: workout.distance_meters,
+            laps: workout
+                .laps
+                .into_iter()
+                .map(|lap| LapResponse {
+                    index: lap.index,
+                    name: lap.name,
+                    moving_duration_seconds: lap.moving_duration_seconds,
+                    elapsed_duration_seconds: lap.elapsed_duration_seconds,
+                    distance_meters: lap.distance_meters,
+                })
+                .collect(),
         }
     }
 }
@@ -502,7 +540,7 @@ fn clear_session(mut response: Response<Body>) -> Response<Body> {
 mod tests {
     use super::*;
     use crate::application::SyncBatch;
-    use crate::domain::WorkoutId;
+    use crate::domain::{WorkoutData, WorkoutId};
 
     #[test]
     fn synchronization_tokens_roundtrip_without_nullable_fields() {
@@ -519,11 +557,11 @@ mod tests {
     #[test]
     fn initial_synchronization_has_explicit_defaults() {
         assert_eq!(
-            sync_request("", 1_000).unwrap(),
+            sync_request("", 40_000_000_000).unwrap(),
             SyncRequest {
-                after_seconds: 0,
+                after_seconds: 8_464_000,
                 event_cursor_millis: 0,
-                snapshot_millis: 1_000,
+                snapshot_millis: 40_000_000_000,
                 page: 1,
             }
         );
@@ -533,13 +571,17 @@ mod tests {
     fn workout_contract_contains_seconds_and_meters() {
         let response = SyncResponse::from(SyncBatch {
             upserted: vec![
-                Workout::new(
-                    WorkoutId::new("strava:7").unwrap(),
-                    "2026-07-15T06:00:00Z",
-                    "Morning Run",
-                    3600,
-                    10_050.5,
-                )
+                Workout::new(WorkoutData {
+                    id: WorkoutId::new("strava:7").unwrap(),
+                    performed_at: "2026-07-15T06:00:00Z".to_owned(),
+                    name: "Morning Run".to_owned(),
+                    description: "Track session".to_owned(),
+                    sport: crate::domain::RunSport::Run,
+                    duration_seconds: 3600,
+                    elapsed_duration_seconds: 3700,
+                    distance_meters: 10_050.5,
+                    laps: vec![crate::domain::Lap::new(1, "Lap 1", 3600, 3700, 10_050.5).unwrap()],
+                })
                 .unwrap(),
             ],
             removed: Vec::new(),
@@ -552,6 +594,8 @@ mod tests {
         assert_eq!(value["upserted"][0]["id"], "strava:7");
         assert_eq!(value["upserted"][0]["durationSeconds"], 3600);
         assert_eq!(value["upserted"][0]["distanceMeters"], 10_050.5);
+        assert_eq!(value["upserted"][0]["description"], "Track session");
+        assert_eq!(value["upserted"][0]["laps"][0]["index"], 1);
         assert_eq!(value["continuation"]["kind"], "complete");
         assert!(value["continuation"]["checkpoint"].is_string());
     }
