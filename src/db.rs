@@ -82,6 +82,14 @@ impl Store {
                 AttributeValue::S(record.user_id.to_string()),
             ),
             (
+                "first_name".to_owned(),
+                AttributeValue::S(record.first_name.clone()),
+            ),
+            (
+                "last_name".to_owned(),
+                AttributeValue::S(record.last_name.clone()),
+            ),
+            (
                 "connection_id".to_owned(),
                 AttributeValue::S(record.connection.id.to_string()),
             ),
@@ -154,6 +162,12 @@ impl Store {
         )?)?;
         Ok(StoredProviderConnection {
             user_id,
+            first_name: optional_s(item, "first_name")
+                .unwrap_or("Strava")
+                .to_owned(),
+            last_name: optional_s(item, "last_name")
+                .unwrap_or("Athlete")
+                .to_owned(),
             connection: ProviderConnection {
                 id: connection_id,
                 provider,
@@ -461,6 +475,12 @@ fn s<'a>(item: &'a HashMap<String, AttributeValue>, key: &str) -> Result<&'a str
         .ok_or_else(|| anyhow!("missing string field {key}"))
 }
 
+fn optional_s<'a>(item: &'a HashMap<String, AttributeValue>, key: &str) -> Option<&'a str> {
+    item.get(key)
+        .and_then(|value| value.as_s().ok())
+        .map(String::as_str)
+}
+
 fn n(item: &HashMap<String, AttributeValue>, key: &str) -> Result<i64, anyhow::Error> {
     item.get(key)
         .and_then(|value| value.as_n().ok())
@@ -487,5 +507,11 @@ mod tests {
     #[test]
     fn raw_session_is_hashed() {
         assert!(!session_pk("secret-session").contains("secret-session"));
+    }
+
+    #[test]
+    fn optional_strings_allow_legacy_connection_records() {
+        let item = HashMap::new();
+        assert_eq!(optional_s(&item, "first_name"), None);
     }
 }

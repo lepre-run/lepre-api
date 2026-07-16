@@ -26,6 +26,8 @@ pub struct ProviderCredentials {
 #[derive(Debug, Clone)]
 pub struct StoredProviderConnection {
     pub user_id: UserId,
+    pub first_name: String,
+    pub last_name: String,
     pub connection: ProviderConnection,
     pub credentials: ProviderCredentials,
     pub token_version: i64,
@@ -37,12 +39,6 @@ pub struct AuthorizedProviderAccount {
     pub first_name: String,
     pub last_name: String,
     pub credentials: ProviderCredentials,
-}
-
-#[derive(Debug)]
-pub struct ProviderProfile {
-    pub first_name: String,
-    pub last_name: String,
 }
 
 #[derive(Debug)]
@@ -150,7 +146,6 @@ pub trait Provider: Send + Sync {
     fn scopes_sufficient(&self, scopes: &str) -> bool;
     async fn authorize(&self, code: &str) -> Result<AuthorizedProviderAccount, anyhow::Error>;
     async fn refresh(&self, refresh_token: &str) -> Result<ProviderCredentials, anyhow::Error>;
-    async fn profile(&self, access_token: &str) -> Result<ProviderProfile, anyhow::Error>;
     async fn workouts(
         &self,
         access_token: &str,
@@ -167,6 +162,12 @@ pub trait Provider: Send + Sync {
 }
 
 #[derive(Debug, Error)]
+#[error("provider rate limited; retry after {retry_after_seconds} seconds")]
+pub struct ProviderRateLimited {
+    pub retry_after_seconds: u64,
+}
+
+#[derive(Debug, Error)]
 pub enum ApplicationError {
     #[error("no authenticated user")]
     Unauthorized,
@@ -174,6 +175,8 @@ pub enum ApplicationError {
     InvalidSynchronization,
     #[error("provider operation failed: {0}")]
     Provider(#[source] anyhow::Error),
+    #[error("provider rate limited; retry after {retry_after_seconds} seconds")]
+    ProviderRateLimited { retry_after_seconds: u64 },
     #[error("persistence operation failed: {0}")]
     Persistence(#[source] anyhow::Error),
     #[error("domain operation failed: {0}")]
@@ -207,7 +210,7 @@ impl Application {
             .provider
             .authorize(code)
             .await
-            .map_err(ApplicationError::Provider)?;
+            .map_err(provider_error)?;
         let existing = self
             .repository
             .connection_for_external(ProviderId::Strava, &authorized.external_account_id)
@@ -227,6 +230,8 @@ impl Application {
         };
         let connection = StoredProviderConnection {
             user_id: user_id.clone(),
+            first_name: authorized.first_name,
+            last_name: authorized.last_name,
             connection: ProviderConnection {
                 id: connection_id,
                 provider: ProviderId::Strava,
@@ -256,18 +261,10 @@ impl Application {
             return Ok(None);
         };
         let connection = self.connection(&user_id).await?;
-        let access_token = self
-            .valid_access_token(connection.clone(), now_seconds)
-            .await?;
-        let profile = self
-            .provider
-            .profile(&access_token)
-            .await
-            .map_err(ApplicationError::Provider)?;
         Ok(Some(User::new(
             user_id,
-            profile.first_name,
-            profile.last_name,
+            connection.first_name,
+            connection.last_name,
             connection.connection,
         )?))
     }
@@ -296,7 +293,7 @@ impl Application {
             .provider
             .workouts(&access_token, request.after_seconds, before, request.page)
             .await
-            .map_err(ApplicationError::Provider)?;
+            .map_err(provider_error)?;
         let mut workouts = page.workouts;
         let has_more = page.has_more;
         if has_more && request.page == MAX_SYNC_PAGES {
@@ -328,7 +325,7 @@ impl Application {
                     .provider
                     .workout(&access_token, event.external_workout_id)
                     .await
-                    .map_err(ApplicationError::Provider)?
+                    .map_err(provider_error)?
                 {
                     Some(workout) => workouts.push(workout),
                     None => {
@@ -460,7 +457,7 @@ impl Application {
                 .provider
                 .refresh(&connection.credentials.refresh_token)
                 .await
-                .map_err(ApplicationError::Provider)?;
+                .map_err(provider_error)?;
             let replacement = StoredProviderConnection {
                 credentials: refreshed.clone(),
                 token_version: connection.token_version + 1,
@@ -479,6 +476,15 @@ impl Application {
         Err(ApplicationError::Provider(anyhow::anyhow!(
             "concurrent token refresh did not settle"
         )))
+    }
+}
+
+fn provider_error(error: anyhow::Error) -> ApplicationError {
+    match error.downcast_ref::<ProviderRateLimited>() {
+        Some(rate_limit) => ApplicationError::ProviderRateLimited {
+            retry_after_seconds: rate_limit.retry_after_seconds,
+        },
+        None => ApplicationError::Provider(error),
     }
 }
 

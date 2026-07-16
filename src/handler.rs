@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use http::header::{CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE};
+use http::header::{CONTENT_TYPE, COOKIE, LOCATION, RETRY_AFTER, SET_COOKIE};
 use http::{Method, StatusCode};
 use lambda_http::{Body, Request, Response};
 use serde::{Deserialize, Serialize};
@@ -498,6 +498,7 @@ fn cors(builder: http::response::Builder) -> http::response::Builder {
         .header("Access-Control-Allow-Credentials", "true")
         .header("Access-Control-Allow-Headers", "Content-Type")
         .header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+        .header("Access-Control-Expose-Headers", "Retry-After")
         .header("Vary", "Origin")
 }
 
@@ -517,6 +518,26 @@ fn application_error(error: ApplicationError) -> Response<Body> {
                 StatusCode::BAD_GATEWAY,
                 &serde_json::json!({"error":"provider_unavailable"}),
             )
+        }
+        ApplicationError::ProviderRateLimited {
+            retry_after_seconds,
+        } => {
+            tracing::warn!(retry_after_seconds, "provider rate limited");
+            let mut response = json(
+                StatusCode::TOO_MANY_REQUESTS,
+                &serde_json::json!({
+                    "error":"provider_rate_limited",
+                    "retryAfterSeconds":retry_after_seconds
+                }),
+            );
+            response.headers_mut().insert(
+                RETRY_AFTER,
+                retry_after_seconds
+                    .to_string()
+                    .parse()
+                    .expect("valid retry-after header"),
+            );
+            response
         }
         error => {
             tracing::error!(%error, "application operation failed");
@@ -598,5 +619,19 @@ mod tests {
         assert_eq!(value["upserted"][0]["laps"][0]["index"], 1);
         assert_eq!(value["continuation"]["kind"], "complete");
         assert!(value["continuation"]["checkpoint"].is_string());
+    }
+
+    #[test]
+    fn provider_rate_limit_is_an_explicit_retryable_response() {
+        let response = application_error(ApplicationError::ProviderRateLimited {
+            retry_after_seconds: 120,
+        });
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[RETRY_AFTER], "120");
+        let Body::Text(body) = response.body() else {
+            panic!("expected JSON body");
+        };
+        assert!(body.contains("provider_rate_limited"));
+        assert!(body.contains("retryAfterSeconds"));
     }
 }

@@ -6,17 +6,18 @@ use std::time::Duration;
 use anyhow::Context;
 use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt, stream};
+use reqwest::header::RETRY_AFTER;
 use serde::{Deserialize, Serialize};
 
 use crate::application::{
-    AuthorizedProviderAccount, Provider, ProviderCredentials, ProviderProfile, ProviderWorkoutPage,
+    AuthorizedProviderAccount, Provider, ProviderCredentials, ProviderRateLimited,
+    ProviderWorkoutPage,
 };
 use crate::domain::{ExternalAccountId, Lap, RunSport, Workout, WorkoutData, WorkoutId};
 
 const AUTHORIZE_URL: &str = "https://www.strava.com/oauth/authorize";
 const TOKEN_URL: &str = "https://www.strava.com/oauth/token";
 const DEAUTHORIZE_URL: &str = "https://www.strava.com/oauth/deauthorize";
-const ATHLETE_URL: &str = "https://www.strava.com/api/v3/athlete";
 const ACTIVITIES_URL: &str = "https://www.strava.com/api/v3/athlete/activities";
 const ACTIVITY_URL: &str = "https://www.strava.com/api/v3/activities";
 const REDIRECT_URI: &str = "https://api.lepre.run/v1/auth/strava/callback";
@@ -24,6 +25,7 @@ const REQUIRED_SCOPES: &[&str] = &["read", "activity:read_all"];
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const ACTIVITY_PAGE_SIZE: i64 = 10;
 const DETAIL_CONCURRENCY: usize = 4;
+const DEFAULT_RATE_LIMIT_RETRY_SECONDS: u64 = 15 * 60;
 
 #[derive(Clone)]
 pub struct StravaProvider {
@@ -38,7 +40,6 @@ struct Endpoints {
     authorize: String,
     token: String,
     deauthorize: String,
-    athlete: String,
     activities: String,
     activity: String,
 }
@@ -49,7 +50,6 @@ impl Default for Endpoints {
             authorize: AUTHORIZE_URL.to_owned(),
             token: TOKEN_URL.to_owned(),
             deauthorize: DEAUTHORIZE_URL.to_owned(),
-            athlete: ATHLETE_URL.to_owned(),
             activities: ACTIVITIES_URL.to_owned(),
             activity: ACTIVITY_URL.to_owned(),
         }
@@ -80,7 +80,6 @@ impl StravaProvider {
                 authorize: format!("{base_url}/authorize"),
                 token: format!("{base_url}/token"),
                 deauthorize: format!("{base_url}/deauthorize"),
-                athlete: format!("{base_url}/athlete"),
                 activities: format!("{base_url}/activities"),
                 activity: format!("{base_url}/activity"),
             },
@@ -280,21 +279,6 @@ impl Provider for StravaProvider {
         })
     }
 
-    async fn profile(&self, access_token: &str) -> Result<ProviderProfile, anyhow::Error> {
-        let athlete: AthleteDto = checked_json(
-            self.client
-                .get(&self.endpoints.athlete)
-                .bearer_auth(access_token)
-                .send()
-                .await?,
-        )
-        .await?;
-        Ok(ProviderProfile {
-            first_name: athlete.firstname,
-            last_name: athlete.lastname,
-        })
-    }
-
     async fn workouts(
         &self,
         access_token: &str,
@@ -381,6 +365,18 @@ async fn checked_json<Value: for<'de> Deserialize<'de>>(
 ) -> Result<Value, anyhow::Error> {
     let status = response.status();
     if !status.is_success() {
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let retry_after_seconds = response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(DEFAULT_RATE_LIMIT_RETRY_SECONDS);
+            return Err(ProviderRateLimited {
+                retry_after_seconds,
+            }
+            .into());
+        }
         let body = response.text().await.unwrap_or_default();
         anyhow::bail!("Strava returned {status}: {body}")
     }
@@ -478,5 +474,26 @@ mod tests {
             .await
             .unwrap();
         assert!(page.workouts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rate_limits_are_reported_explicitly() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/activities"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "120")
+                    .set_body_json(serde_json::json!({"message":"Rate Limit Exceeded"})),
+            )
+            .mount(&server)
+            .await;
+
+        let error = StravaProvider::with_base_url(&server.uri())
+            .workouts("token", 0, 1_800_000_000, 1)
+            .await
+            .unwrap_err();
+        let rate_limit = error.downcast_ref::<ProviderRateLimited>().unwrap();
+        assert_eq!(rate_limit.retry_after_seconds, 120);
     }
 }
