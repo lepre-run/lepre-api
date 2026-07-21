@@ -3,8 +3,9 @@
 Thin Rust Lambda fronting `api.lepre.run`. Workout records remain in the
 browser. DynamoDB contains only provider connections with encrypted tokens and
 the athlete's display name, browser sessions, external-account lookups and
-short-lived webhook events. Session reads are served entirely from DynamoDB and
-do not consume Strava requests.
+short-lived webhook events. It also holds expiring synchronization queue markers
+and conservative quota reservations, but never workout payloads. Session reads
+are served entirely from DynamoDB and do not consume Strava requests.
 
 Routes:
 
@@ -23,8 +24,10 @@ selected original fields Lepre needs: identity, date, name, public description,
 sport, workout/race type, moving and elapsed duration, distance, activity heart
 rate, and laps with their heart-rate aggregates. The Lambda fetches this content
 transiently from Strava and never persists it.
-Strava rate limits are returned as HTTP 429 with a retry interval so the browser
-can checkpoint, pause and resume the import.
+Each browser request enters a fair, fixed-cost synchronization queue. HTTP 202
+means that the browser keeps its local checkpoint and retries after the supplied
+interval; HTTP 429 provides the same pause-and-resume behavior if Strava reports
+a limit directly.
 
 Code follows the Clean Architecture dependency rule:
 

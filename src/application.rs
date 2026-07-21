@@ -15,6 +15,8 @@ use crate::domain::{
 
 const SESSION_SECONDS: i64 = 30 * 24 * 60 * 60;
 const MAX_SYNC_PAGES: i64 = 1_000;
+const MAX_SYNC_EVENT_BATCH: usize = 10;
+pub const SYNC_BATCH_REQUEST_COST: i64 = 21;
 
 #[derive(Debug, Clone)]
 pub struct ProviderCredentials {
@@ -58,7 +60,13 @@ pub struct SyncRequest {
     pub after_seconds: i64,
     pub event_cursor_millis: i64,
     pub snapshot_millis: i64,
-    pub page: i64,
+    pub phase: SyncPhase,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncPhase {
+    Activities { page: i64 },
+    Events { offset: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +86,31 @@ pub struct SyncBatch {
     pub upserted: Vec<Workout>,
     pub removed: Vec<WorkoutId>,
     pub continuation: SyncContinuation,
+}
+
+#[derive(Debug, Clone)]
+pub struct SyncGateConfig {
+    pub read_limit_15_minutes: i64,
+    pub read_limit_daily: i64,
+    pub safety_percent: i64,
+    pub queue_lease_seconds: i64,
+    pub poll_seconds: u64,
+}
+
+impl SyncGateConfig {
+    pub fn safe_limit_15_minutes(&self) -> i64 {
+        self.read_limit_15_minutes * self.safety_percent / 100
+    }
+
+    pub fn safe_limit_daily(&self) -> i64 {
+        self.read_limit_daily * self.safety_percent / 100
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncTurn {
+    Granted,
+    Queued { retry_after_seconds: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +171,12 @@ pub trait Repository: Send + Sync {
         after_millis: i64,
         through_millis: i64,
     ) -> Result<Vec<ProviderEvent>, anyhow::Error>;
+    async fn acquire_sync_turn(
+        &self,
+        user_id: &UserId,
+        now_millis: i64,
+        config: &SyncGateConfig,
+    ) -> Result<SyncTurn, anyhow::Error>;
 }
 
 #[async_trait]
@@ -177,6 +216,8 @@ pub enum ApplicationError {
     Provider(#[source] anyhow::Error),
     #[error("provider rate limited; retry after {retry_after_seconds} seconds")]
     ProviderRateLimited { retry_after_seconds: u64 },
+    #[error("synchronization queued; retry after {retry_after_seconds} seconds")]
+    SynchronizationQueued { retry_after_seconds: u64 },
     #[error("persistence operation failed: {0}")]
     Persistence(#[source] anyhow::Error),
     #[error("domain operation failed: {0}")]
@@ -187,13 +228,19 @@ pub enum ApplicationError {
 pub struct Application {
     repository: Arc<dyn Repository>,
     provider: Arc<dyn Provider>,
+    sync_gate: SyncGateConfig,
 }
 
 impl Application {
-    pub fn new(repository: Arc<dyn Repository>, provider: Arc<dyn Provider>) -> Self {
+    pub fn new(
+        repository: Arc<dyn Repository>,
+        provider: Arc<dyn Provider>,
+        sync_gate: SyncGateConfig,
+    ) -> Self {
         Self {
             repository,
             provider,
+            sync_gate,
         }
     }
 
@@ -273,35 +320,67 @@ impl Application {
         &self,
         raw_session: &str,
         request: SyncRequest,
-        now_seconds: i64,
+        now_millis: i64,
     ) -> Result<SyncBatch, ApplicationError> {
-        if !(1..=MAX_SYNC_PAGES).contains(&request.page)
+        let valid_phase = match &request.phase {
+            SyncPhase::Activities { page } => (1..=MAX_SYNC_PAGES).contains(page),
+            SyncPhase::Events { offset } => *offset <= MAX_SYNC_PAGES as usize * 1_000,
+        };
+        if !valid_phase
             || request.after_seconds < 0
             || request.event_cursor_millis < 0
             || request.snapshot_millis < 1
         {
             return Err(ApplicationError::InvalidSynchronization);
         }
+        let now_seconds = now_millis / 1_000;
         let user_id = self
             .authenticate(raw_session, now_seconds)
             .await?
             .ok_or(ApplicationError::Unauthorized)?;
+        match self
+            .repository
+            .acquire_sync_turn(&user_id, now_millis, &self.sync_gate)
+            .await
+            .map_err(ApplicationError::Persistence)?
+        {
+            SyncTurn::Granted => {}
+            SyncTurn::Queued {
+                retry_after_seconds,
+            } => {
+                return Err(ApplicationError::SynchronizationQueued {
+                    retry_after_seconds,
+                });
+            }
+        }
         let connection = self.connection(&user_id).await?;
         let access_token = self.valid_access_token(connection, now_seconds).await?;
         let before = request.snapshot_millis / 1000 + 1;
-        let page = self
-            .provider
-            .workouts(&access_token, request.after_seconds, before, request.page)
-            .await
-            .map_err(provider_error)?;
-        let mut workouts = page.workouts;
-        let has_more = page.has_more;
-        if has_more && request.page == MAX_SYNC_PAGES {
-            return Err(ApplicationError::InvalidSynchronization);
-        }
-        let events = if has_more {
-            Vec::new()
-        } else {
+        let (mut workouts, event_offset) = match request.phase.clone() {
+            SyncPhase::Activities { page } => {
+                let provider_page = self
+                    .provider
+                    .workouts(&access_token, request.after_seconds, before, page)
+                    .await
+                    .map_err(provider_error)?;
+                if provider_page.has_more && page == MAX_SYNC_PAGES {
+                    return Err(ApplicationError::InvalidSynchronization);
+                }
+                if provider_page.has_more {
+                    return Ok(SyncBatch {
+                        upserted: provider_page.workouts,
+                        removed: Vec::new(),
+                        continuation: SyncContinuation::More(SyncRequest {
+                            phase: SyncPhase::Activities { page: page + 1 },
+                            ..request
+                        }),
+                    });
+                }
+                (provider_page.workouts, 0)
+            }
+            SyncPhase::Events { offset } => (Vec::new(), offset),
+        };
+        let events = coalesce_events(
             self.repository
                 .events(
                     &user_id,
@@ -309,14 +388,15 @@ impl Application {
                     request.snapshot_millis,
                 )
                 .await
-                .map_err(ApplicationError::Persistence)?
-        };
+                .map_err(ApplicationError::Persistence)?,
+        );
         let mut removed = HashSet::new();
         let present: HashSet<String> = workouts
             .iter()
             .map(|workout| workout.id.as_str().to_owned())
             .collect();
-        for event in events {
+        let event_batch = events.iter().skip(event_offset).take(MAX_SYNC_EVENT_BATCH);
+        for event in event_batch {
             let workout_id = WorkoutId::new(format!("strava:{}", event.external_workout_id))?;
             if event.aspect == "delete" {
                 removed.insert(workout_id);
@@ -336,9 +416,12 @@ impl Application {
         }
         workouts.retain(|workout| !removed.contains(&workout.id));
         workouts.sort_by(|left, right| right.performed_at.cmp(&left.performed_at));
-        let continuation = if has_more {
+        let next_event_offset = event_offset.saturating_add(MAX_SYNC_EVENT_BATCH);
+        let continuation = if next_event_offset < events.len() {
             SyncContinuation::More(SyncRequest {
-                page: request.page + 1,
+                phase: SyncPhase::Events {
+                    offset: next_event_offset,
+                },
                 ..request
             })
         } else {
@@ -477,6 +560,21 @@ impl Application {
             "concurrent token refresh did not settle"
         )))
     }
+}
+
+fn coalesce_events(events: Vec<ProviderEvent>) -> Vec<ProviderEvent> {
+    let mut coalesced: Vec<ProviderEvent> = Vec::new();
+    for event in events {
+        if let Some(existing) = coalesced
+            .iter_mut()
+            .find(|existing| existing.external_workout_id == event.external_workout_id)
+        {
+            *existing = event;
+        } else {
+            coalesced.push(event);
+        }
+    }
+    coalesced
 }
 
 fn provider_error(error: anyhow::Error) -> ApplicationError {

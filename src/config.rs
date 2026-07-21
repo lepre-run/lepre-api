@@ -10,6 +10,8 @@ use std::collections::HashMap;
 use anyhow::{Context, anyhow};
 use base64::Engine as _;
 
+use crate::application::{SYNC_BATCH_REQUEST_COST, SyncGateConfig};
+
 const SSM_NAMES: &[&str] = &[
     "/lepre/api/strava_client_id",
     "/lepre/api/strava_client_secret",
@@ -27,6 +29,7 @@ pub struct Config {
     /// 32-byte AES-256 key, decoded from the base64 SSM value.
     pub token_encryption_key: [u8; 32],
     pub key_version: i32,
+    pub sync_gate: SyncGateConfig,
 }
 
 impl Config {
@@ -90,6 +93,22 @@ impl Config {
             .try_into()
             .map_err(|_| anyhow!("token_encryption_key must decode to exactly 32 bytes"))?;
 
+        let sync_gate = SyncGateConfig {
+            read_limit_15_minutes: environment_integer("STRAVA_READ_LIMIT_15_MINUTES", 100)?,
+            read_limit_daily: environment_integer("STRAVA_READ_LIMIT_DAILY", 1_000)?,
+            safety_percent: environment_integer("STRAVA_QUOTA_SAFETY_PERCENT", 90)?,
+            queue_lease_seconds: environment_integer("SYNC_QUEUE_LEASE_SECONDS", 30)?,
+            poll_seconds: environment_integer("SYNC_QUEUE_POLL_SECONDS", 2)? as u64,
+        };
+        if !(50..=100).contains(&sync_gate.safety_percent)
+            || sync_gate.queue_lease_seconds < 10
+            || sync_gate.poll_seconds == 0
+            || sync_gate.safe_limit_15_minutes() < SYNC_BATCH_REQUEST_COST
+            || sync_gate.safe_limit_daily() < SYNC_BATCH_REQUEST_COST
+        {
+            return Err(anyhow!("invalid synchronization gate configuration"));
+        }
+
         Ok(Self {
             strava_client_id,
             strava_client_secret,
@@ -97,12 +116,19 @@ impl Config {
             table_name: std::env::var("LEPRE_TABLE_NAME").unwrap_or_else(|_| "lepre".to_owned()),
             token_encryption_key,
             key_version: 1,
+            sync_gate,
         })
     }
 
     pub fn strava_configured(&self) -> bool {
         !self.strava_client_id.is_empty() && !self.strava_client_secret.is_empty()
     }
+}
+
+fn environment_integer(name: &str, default: i64) -> Result<i64, anyhow::Error> {
+    std::env::var(name)
+        .map_or_else(|_| Ok(default), |value| value.parse())
+        .with_context(|| format!("{name} must be an integer"))
 }
 
 #[cfg(test)]

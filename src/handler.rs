@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
 use crate::application::{
-    Application, ApplicationError, SyncContinuation, SyncRequest, WebhookEvent,
+    Application, ApplicationError, SyncContinuation, SyncPhase, SyncRequest, WebhookEvent,
 };
 use crate::config::Config;
 use crate::cookie::{
@@ -147,7 +147,7 @@ async fn workouts(req: &Request, ctx: &Ctx) -> Response<Body> {
     };
     match ctx
         .application
-        .synchronize(&raw_session, request, now_seconds())
+        .synchronize(&raw_session, request, now_millis())
         .await
     {
         Ok(batch) => json(StatusCode::OK, &SyncResponse::from(batch)),
@@ -280,7 +280,32 @@ struct ContinuationToken {
     after_seconds: i64,
     event_cursor_millis: i64,
     snapshot_millis: i64,
-    page: i64,
+    phase: ContinuationPhase,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ContinuationPhase {
+    Activities { page: i64 },
+    Events { offset: usize },
+}
+
+impl From<ContinuationPhase> for SyncPhase {
+    fn from(value: ContinuationPhase) -> Self {
+        match value {
+            ContinuationPhase::Activities { page } => Self::Activities { page },
+            ContinuationPhase::Events { offset } => Self::Events { offset },
+        }
+    }
+}
+
+impl From<SyncPhase> for ContinuationPhase {
+    fn from(value: SyncPhase) -> Self {
+        match value {
+            SyncPhase::Activities { page } => Self::Activities { page },
+            SyncPhase::Events { offset } => Self::Events { offset },
+        }
+    }
 }
 
 fn sync_request(query: &str, snapshot_millis: i64) -> Result<SyncRequest, anyhow::Error> {
@@ -297,7 +322,7 @@ fn sync_request(query: &str, snapshot_millis: i64) -> Result<SyncRequest, anyhow
                 after_seconds: token.after_seconds,
                 event_cursor_millis: token.event_cursor_millis,
                 snapshot_millis: token.snapshot_millis,
-                page: token.page,
+                phase: token.phase.into(),
             })
         }
         (Some(value), None) => {
@@ -306,7 +331,7 @@ fn sync_request(query: &str, snapshot_millis: i64) -> Result<SyncRequest, anyhow
                 after_seconds: checkpoint.after_seconds,
                 event_cursor_millis: checkpoint.event_cursor_millis,
                 snapshot_millis,
-                page: 1,
+                phase: SyncPhase::Activities { page: 1 },
             })
         }
         (None, None) => Ok(SyncRequest {
@@ -315,7 +340,7 @@ fn sync_request(query: &str, snapshot_millis: i64) -> Result<SyncRequest, anyhow
                 .max(0),
             event_cursor_millis: 0,
             snapshot_millis,
-            page: 1,
+            phase: SyncPhase::Activities { page: 1 },
         }),
     }
 }
@@ -443,7 +468,7 @@ impl From<crate::application::SyncBatch> for SyncResponse {
                     after_seconds: request.after_seconds,
                     event_cursor_millis: request.event_cursor_millis,
                     snapshot_millis: request.snapshot_millis,
-                    page: request.page,
+                    phase: request.phase.into(),
                 }),
             },
             SyncContinuation::Complete(checkpoint) => ContinuationResponse::Complete {
@@ -550,6 +575,30 @@ fn application_error(error: ApplicationError) -> Response<Body> {
             );
             response
         }
+        ApplicationError::SynchronizationQueued {
+            retry_after_seconds,
+        } => {
+            tracing::info!(
+                event = "strava_sync_queued",
+                retry_after_seconds,
+                "synchronization is waiting for a fair Strava turn"
+            );
+            let mut response = json(
+                StatusCode::ACCEPTED,
+                &serde_json::json!({
+                    "status":"queued",
+                    "retryAfterSeconds":retry_after_seconds
+                }),
+            );
+            response.headers_mut().insert(
+                RETRY_AFTER,
+                retry_after_seconds
+                    .to_string()
+                    .parse()
+                    .expect("valid retry-after header"),
+            );
+            response
+        }
         error => {
             tracing::error!(%error, "application operation failed");
             json(
@@ -594,7 +643,7 @@ mod tests {
                 after_seconds: 8_464_000,
                 event_cursor_millis: 0,
                 snapshot_millis: 40_000_000_000,
-                page: 1,
+                phase: SyncPhase::Activities { page: 1 },
             }
         );
     }
@@ -664,6 +713,20 @@ mod tests {
             panic!("expected JSON body");
         };
         assert!(body.contains("provider_rate_limited"));
+        assert!(body.contains("retryAfterSeconds"));
+    }
+
+    #[test]
+    fn fair_queue_wait_is_an_explicit_retryable_response() {
+        let response = application_error(ApplicationError::SynchronizationQueued {
+            retry_after_seconds: 5,
+        });
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(response.headers()[RETRY_AFTER], "5");
+        let Body::Text(body) = response.body() else {
+            panic!("expected JSON body");
+        };
+        assert!(body.contains("queued"));
         assert!(body.contains("retryAfterSeconds"));
     }
 }

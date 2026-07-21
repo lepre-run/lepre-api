@@ -6,11 +6,15 @@ use anyhow::{Context, anyhow};
 use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::primitives::Blob;
-use aws_sdk_dynamodb::types::AttributeValue;
+use aws_sdk_dynamodb::types::{
+    AttributeValue, Delete as TransactDelete, Put as TransactPut, TransactWriteItem,
+    Update as TransactUpdate,
+};
 use sha2::{Digest, Sha256};
 
 use crate::application::{
-    ProviderCredentials, ProviderEvent, Repository, StoredProviderConnection,
+    ProviderCredentials, ProviderEvent, Repository, SYNC_BATCH_REQUEST_COST,
+    StoredProviderConnection, SyncGateConfig, SyncTurn,
 };
 use crate::crypto::{EncryptedToken, TokenKind, decrypt, encrypt};
 use crate::domain::{ConnectionId, ExternalAccountId, ProviderConnection, ProviderId, UserId};
@@ -19,6 +23,14 @@ const PK: &str = "pk";
 const SK: &str = "sk";
 const CONNECTION_SK: &str = "CONNECTION";
 const SESSION_SK: &str = "SESSION";
+const SYNC_QUEUE_PK: &str = "SYNC_QUEUE";
+const SYNC_QUEUE_MARKER_SK: &str = "SYNC_QUEUE";
+const STRAVA_QUOTA_PK: &str = "STRAVA_QUOTA";
+
+struct QueueMarker {
+    queue_sk: String,
+    expires_at_millis: i64,
+}
 
 #[derive(Clone)]
 pub struct Store {
@@ -180,6 +192,322 @@ impl Store {
             },
             token_version: n(item, "token_version")?,
         })
+    }
+
+    async fn queue_marker(&self, user_id: &UserId) -> Result<Option<QueueMarker>, anyhow::Error> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(&self.table)
+            .key(PK, AttributeValue::S(user_pk(user_id)))
+            .key(SK, AttributeValue::S(SYNC_QUEUE_MARKER_SK.to_owned()))
+            .consistent_read(true)
+            .send()
+            .await
+            .context("dynamodb get synchronization queue marker failed")?;
+        response
+            .item
+            .as_ref()
+            .map(|item| {
+                Ok(QueueMarker {
+                    queue_sk: s(item, "queue_sk")?.to_owned(),
+                    expires_at_millis: n(item, "expires_at_millis")?,
+                })
+            })
+            .transpose()
+    }
+
+    async fn delete_expired_queue_entry(
+        &self,
+        queue_sk: &str,
+        user_id: &UserId,
+        now_millis: i64,
+    ) -> Result<(), anyhow::Error> {
+        let _ = self
+            .client
+            .delete_item()
+            .table_name(&self.table)
+            .key(PK, AttributeValue::S(SYNC_QUEUE_PK.to_owned()))
+            .key(SK, AttributeValue::S(queue_sk.to_owned()))
+            .condition_expression("expires_at_millis <= :now")
+            .expression_attribute_values(":now", AttributeValue::N(now_millis.to_string()))
+            .send()
+            .await;
+        let _ = self
+            .client
+            .delete_item()
+            .table_name(&self.table)
+            .key(PK, AttributeValue::S(user_pk(user_id)))
+            .key(SK, AttributeValue::S(SYNC_QUEUE_MARKER_SK.to_owned()))
+            .condition_expression("queue_sk = :queue_sk AND expires_at_millis <= :now")
+            .expression_attribute_values(":queue_sk", AttributeValue::S(queue_sk.to_owned()))
+            .expression_attribute_values(":now", AttributeValue::N(now_millis.to_string()))
+            .send()
+            .await;
+        Ok(())
+    }
+
+    async fn touch_queue_entry(
+        &self,
+        marker: &QueueMarker,
+        user_id: &UserId,
+        expires_at_millis: i64,
+    ) -> Result<(), anyhow::Error> {
+        let expires_at = expires_at_millis / 1_000 + 1;
+        self.client
+            .update_item()
+            .table_name(&self.table)
+            .key(PK, AttributeValue::S(SYNC_QUEUE_PK.to_owned()))
+            .key(SK, AttributeValue::S(marker.queue_sk.clone()))
+            .update_expression("SET expires_at_millis = :expires_millis, expires_at = :expires")
+            .condition_expression("user_id = :user_id")
+            .expression_attribute_values(
+                ":expires_millis",
+                AttributeValue::N(expires_at_millis.to_string()),
+            )
+            .expression_attribute_values(":expires", AttributeValue::N(expires_at.to_string()))
+            .expression_attribute_values(":user_id", AttributeValue::S(user_id.to_string()))
+            .send()
+            .await
+            .context("dynamodb refresh synchronization queue entry failed")?;
+        self.client
+            .update_item()
+            .table_name(&self.table)
+            .key(PK, AttributeValue::S(user_pk(user_id)))
+            .key(SK, AttributeValue::S(SYNC_QUEUE_MARKER_SK.to_owned()))
+            .update_expression("SET expires_at_millis = :expires_millis, expires_at = :expires")
+            .condition_expression("queue_sk = :queue_sk")
+            .expression_attribute_values(
+                ":expires_millis",
+                AttributeValue::N(expires_at_millis.to_string()),
+            )
+            .expression_attribute_values(":expires", AttributeValue::N(expires_at.to_string()))
+            .expression_attribute_values(":queue_sk", AttributeValue::S(marker.queue_sk.clone()))
+            .send()
+            .await
+            .context("dynamodb refresh synchronization queue marker failed")?;
+        Ok(())
+    }
+
+    async fn enqueue_sync(
+        &self,
+        user_id: &UserId,
+        now_millis: i64,
+        lease_seconds: i64,
+    ) -> Result<QueueMarker, anyhow::Error> {
+        if let Some(marker) = self.queue_marker(user_id).await? {
+            if marker.expires_at_millis > now_millis {
+                self.touch_queue_entry(&marker, user_id, now_millis + lease_seconds * 1_000)
+                    .await?;
+                return Ok(marker);
+            }
+            self.delete_expired_queue_entry(&marker.queue_sk, user_id, now_millis)
+                .await?;
+        }
+
+        let queue_sk = format!("TURN#{now_millis:020}#{}", uuid::Uuid::new_v4());
+        let expires_at_millis = now_millis + lease_seconds * 1_000;
+        let expires_at = expires_at_millis / 1_000 + 1;
+        let queue_put = TransactPut::builder()
+            .table_name(&self.table)
+            .item(PK, AttributeValue::S(SYNC_QUEUE_PK.to_owned()))
+            .item(SK, AttributeValue::S(queue_sk.clone()))
+            .item("user_id", AttributeValue::S(user_id.to_string()))
+            .item(
+                "expires_at_millis",
+                AttributeValue::N(expires_at_millis.to_string()),
+            )
+            .item("expires_at", AttributeValue::N(expires_at.to_string()))
+            .condition_expression("attribute_not_exists(pk)")
+            .build()?;
+        let marker_put = TransactPut::builder()
+            .table_name(&self.table)
+            .item(PK, AttributeValue::S(user_pk(user_id)))
+            .item(SK, AttributeValue::S(SYNC_QUEUE_MARKER_SK.to_owned()))
+            .item("queue_sk", AttributeValue::S(queue_sk.clone()))
+            .item(
+                "expires_at_millis",
+                AttributeValue::N(expires_at_millis.to_string()),
+            )
+            .item("expires_at", AttributeValue::N(expires_at.to_string()))
+            .condition_expression("attribute_not_exists(pk)")
+            .build()?;
+        let result = self
+            .client
+            .transact_write_items()
+            .transact_items(TransactWriteItem::builder().put(queue_put).build())
+            .transact_items(TransactWriteItem::builder().put(marker_put).build())
+            .send()
+            .await;
+        match result {
+            Ok(_) => Ok(QueueMarker {
+                queue_sk,
+                expires_at_millis,
+            }),
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(|value| value.is_transaction_canceled_exception()) =>
+            {
+                self.queue_marker(user_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("synchronization queue enqueue raced without marker"))
+            }
+            Err(error) => Err(error).context("dynamodb enqueue synchronization failed"),
+        }
+    }
+
+    async fn queue_head(&self) -> Result<Option<HashMap<String, AttributeValue>>, anyhow::Error> {
+        let response = self
+            .client
+            .query()
+            .table_name(&self.table)
+            .key_condition_expression("pk = :pk AND begins_with(sk, :turn)")
+            .expression_attribute_values(":pk", AttributeValue::S(SYNC_QUEUE_PK.to_owned()))
+            .expression_attribute_values(":turn", AttributeValue::S("TURN#".to_owned()))
+            .scan_index_forward(true)
+            .consistent_read(true)
+            .limit(1)
+            .send()
+            .await
+            .context("dynamodb read synchronization queue head failed")?;
+        Ok(response.items.and_then(|mut items| items.pop()))
+    }
+
+    async fn quota_reserved(&self, quota_sk: &str) -> Result<i64, anyhow::Error> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(&self.table)
+            .key(PK, AttributeValue::S(STRAVA_QUOTA_PK.to_owned()))
+            .key(SK, AttributeValue::S(quota_sk.to_owned()))
+            .consistent_read(true)
+            .send()
+            .await
+            .context("dynamodb read Strava quota reservation failed")?;
+        response
+            .item
+            .as_ref()
+            .map_or(Ok(0), |item| n(item, "reserved"))
+    }
+
+    async fn reserve_sync_turn(
+        &self,
+        marker: &QueueMarker,
+        user_id: &UserId,
+        now_seconds: i64,
+        config: &SyncGateConfig,
+    ) -> Result<SyncTurn, anyhow::Error> {
+        let window_start = now_seconds.div_euclid(15 * 60) * 15 * 60;
+        let day_start = now_seconds.div_euclid(24 * 60 * 60) * 24 * 60 * 60;
+        let window_sk = format!("READ#15M#{window_start:020}");
+        let day_sk = format!("READ#DAY#{day_start:020}");
+        let reserved_15 = self.quota_reserved(&window_sk).await?;
+        let reserved_daily = self.quota_reserved(&day_sk).await?;
+        let limit_15 = config.safe_limit_15_minutes();
+        let limit_daily = config.safe_limit_daily();
+        let window_blocked = reserved_15 + SYNC_BATCH_REQUEST_COST > limit_15;
+        let day_blocked = reserved_daily + SYNC_BATCH_REQUEST_COST > limit_daily;
+        if window_blocked || day_blocked {
+            let mut retry_after_seconds = config.poll_seconds;
+            if window_blocked {
+                retry_after_seconds =
+                    retry_after_seconds.max((window_start + 15 * 60 - now_seconds).max(1) as u64);
+            }
+            if day_blocked {
+                retry_after_seconds =
+                    retry_after_seconds.max((day_start + 24 * 60 * 60 - now_seconds).max(1) as u64);
+            }
+            let queue_keepalive_seconds = config
+                .poll_seconds
+                .max((config.queue_lease_seconds / 2).max(1) as u64);
+            return Ok(SyncTurn::Queued {
+                retry_after_seconds: retry_after_seconds.min(queue_keepalive_seconds),
+            });
+        }
+
+        let quota_update = |quota_sk: &str, limit: i64, expires_at: i64| {
+            TransactUpdate::builder()
+                .table_name(&self.table)
+                .key(PK, AttributeValue::S(STRAVA_QUOTA_PK.to_owned()))
+                .key(SK, AttributeValue::S(quota_sk.to_owned()))
+                .update_expression(
+                    "SET reserved = if_not_exists(reserved, :zero) + :cost, expires_at = :expires",
+                )
+                .condition_expression("attribute_not_exists(reserved) OR reserved <= :maximum")
+                .expression_attribute_values(":zero", AttributeValue::N("0".to_owned()))
+                .expression_attribute_values(
+                    ":cost",
+                    AttributeValue::N(SYNC_BATCH_REQUEST_COST.to_string()),
+                )
+                .expression_attribute_values(
+                    ":maximum",
+                    AttributeValue::N((limit - SYNC_BATCH_REQUEST_COST).to_string()),
+                )
+                .expression_attribute_values(":expires", AttributeValue::N(expires_at.to_string()))
+                .build()
+        };
+        let queue_delete = TransactDelete::builder()
+            .table_name(&self.table)
+            .key(PK, AttributeValue::S(SYNC_QUEUE_PK.to_owned()))
+            .key(SK, AttributeValue::S(marker.queue_sk.clone()))
+            .condition_expression("user_id = :user_id")
+            .expression_attribute_values(":user_id", AttributeValue::S(user_id.to_string()))
+            .build()?;
+        let marker_delete = TransactDelete::builder()
+            .table_name(&self.table)
+            .key(PK, AttributeValue::S(user_pk(user_id)))
+            .key(SK, AttributeValue::S(SYNC_QUEUE_MARKER_SK.to_owned()))
+            .condition_expression("queue_sk = :queue_sk")
+            .expression_attribute_values(":queue_sk", AttributeValue::S(marker.queue_sk.clone()))
+            .build()?;
+        let result = self
+            .client
+            .transact_write_items()
+            .transact_items(
+                TransactWriteItem::builder()
+                    .update(quota_update(
+                        &window_sk,
+                        limit_15,
+                        window_start + 2 * 24 * 60 * 60,
+                    )?)
+                    .build(),
+            )
+            .transact_items(
+                TransactWriteItem::builder()
+                    .update(quota_update(
+                        &day_sk,
+                        limit_daily,
+                        day_start + 3 * 24 * 60 * 60,
+                    )?)
+                    .build(),
+            )
+            .transact_items(TransactWriteItem::builder().delete(queue_delete).build())
+            .transact_items(TransactWriteItem::builder().delete(marker_delete).build())
+            .send()
+            .await;
+        match result {
+            Ok(_) => {
+                tracing::info!(
+                    event = "strava_sync_turn_granted",
+                    request_cost = SYNC_BATCH_REQUEST_COST,
+                    reserved_15_minutes = reserved_15 + SYNC_BATCH_REQUEST_COST,
+                    reserved_daily = reserved_daily + SYNC_BATCH_REQUEST_COST,
+                    "granted a fair Strava synchronization turn"
+                );
+                Ok(SyncTurn::Granted)
+            }
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(|value| value.is_transaction_canceled_exception()) =>
+            {
+                Ok(SyncTurn::Queued {
+                    retry_after_seconds: config.poll_seconds,
+                })
+            }
+            Err(error) => Err(error).context("dynamodb reserve synchronization turn failed"),
+        }
     }
 }
 
@@ -430,6 +758,44 @@ impl Repository for Store {
                 })
             })
             .collect()
+    }
+
+    async fn acquire_sync_turn(
+        &self,
+        user_id: &UserId,
+        now_millis: i64,
+        config: &SyncGateConfig,
+    ) -> Result<SyncTurn, anyhow::Error> {
+        for _ in 0..4 {
+            let marker = self
+                .enqueue_sync(user_id, now_millis, config.queue_lease_seconds)
+                .await?;
+            let Some(head) = self.queue_head().await? else {
+                return Ok(SyncTurn::Queued {
+                    retry_after_seconds: config.poll_seconds,
+                });
+            };
+            let head_queue_sk = s(&head, SK)?.to_owned();
+            let head_user_id = UserId::new(s(&head, "user_id")?)?;
+            let head_expires_at_millis = n(&head, "expires_at_millis")?;
+            if head_expires_at_millis <= now_millis {
+                self.delete_expired_queue_entry(&head_queue_sk, &head_user_id, now_millis)
+                    .await?;
+                continue;
+            }
+            if head_user_id != *user_id {
+                return Ok(SyncTurn::Queued {
+                    retry_after_seconds: config.poll_seconds,
+                });
+            }
+            return self
+                .reserve_sync_turn(&marker, user_id, now_millis / 1_000, config)
+                .await;
+        }
+
+        Ok(SyncTurn::Queued {
+            retry_after_seconds: config.poll_seconds,
+        })
     }
 }
 

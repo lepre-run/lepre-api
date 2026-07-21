@@ -1,7 +1,7 @@
 //! Strava outbound adapter. Strava DTOs never leave this module.
 
 use std::collections::HashSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -257,6 +257,7 @@ impl Provider for StravaProvider {
     }
 
     async fn authorize(&self, code: &str) -> Result<AuthorizedProviderAccount, anyhow::Error> {
+        let started = Instant::now();
         let response: TokenResponseDto = checked_json(
             self.client
                 .post(&self.endpoints.token)
@@ -268,6 +269,8 @@ impl Provider for StravaProvider {
                 })
                 .send()
                 .await?,
+            "authorize",
+            started,
         )
         .await?;
         Ok(AuthorizedProviderAccount {
@@ -283,6 +286,7 @@ impl Provider for StravaProvider {
     }
 
     async fn refresh(&self, refresh_token: &str) -> Result<ProviderCredentials, anyhow::Error> {
+        let started = Instant::now();
         let response: RefreshedTokenDto = checked_json(
             self.client
                 .post(&self.endpoints.token)
@@ -294,6 +298,8 @@ impl Provider for StravaProvider {
                 })
                 .send()
                 .await?,
+            "refresh_token",
+            started,
         )
         .await?;
         Ok(ProviderCredentials {
@@ -310,6 +316,7 @@ impl Provider for StravaProvider {
         before: i64,
         page: i64,
     ) -> Result<ProviderWorkoutPage, anyhow::Error> {
+        let started = Instant::now();
         let activities: Vec<SummaryActivityDto> = checked_json(
             self.client
                 .get(&self.endpoints.activities)
@@ -322,6 +329,8 @@ impl Provider for StravaProvider {
                 ])
                 .send()
                 .await?,
+            "list_activities",
+            started,
         )
         .await?;
         let has_more = activities.len() == ACTIVITY_PAGE_SIZE as usize;
@@ -350,12 +359,14 @@ impl Provider for StravaProvider {
     }
 
     async fn deauthorize(&self, access_token: &str) -> Result<(), anyhow::Error> {
+        let started = Instant::now();
         let response = self
             .client
             .post(&self.endpoints.deauthorize)
             .bearer_auth(access_token)
             .send()
             .await?;
+        record_response(&response, "deauthorize", started);
         if !response.status().is_success() {
             anyhow::bail!("Strava deauthorization returned {}", response.status())
         }
@@ -369,6 +380,7 @@ impl StravaProvider {
         access_token: &str,
         external_workout_id: i64,
     ) -> Result<Option<Workout>, anyhow::Error> {
+        let started = Instant::now();
         let response = self
             .client
             .get(format!("{}/{external_workout_id}", self.endpoints.activity))
@@ -376,15 +388,25 @@ impl StravaProvider {
             .query(&[("include_all_efforts", false)])
             .send()
             .await?;
+        record_response(&response, "activity_detail", started);
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        let activity: DetailedActivityDto = checked_json(response).await?;
+        let activity: DetailedActivityDto = checked_json_body(response).await?;
         activity.into_domain()
     }
 }
 
 async fn checked_json<Value: for<'de> Deserialize<'de>>(
+    response: reqwest::Response,
+    endpoint: &'static str,
+    started: Instant,
+) -> Result<Value, anyhow::Error> {
+    record_response(&response, endpoint, started);
+    checked_json_body(response).await
+}
+
+async fn checked_json_body<Value: for<'de> Deserialize<'de>>(
     response: reqwest::Response,
 ) -> Result<Value, anyhow::Error> {
     let status = response.status();
@@ -405,6 +427,43 @@ async fn checked_json<Value: for<'de> Deserialize<'de>>(
         anyhow::bail!("Strava returned {status}: {body}")
     }
     response.json().await.context("invalid Strava response")
+}
+
+fn record_response(response: &reqwest::Response, endpoint: &'static str, started: Instant) {
+    let (overall_limit_15_minutes, overall_limit_daily) =
+        rate_limit_pair(response, "x-ratelimit-limit");
+    let (overall_usage_15_minutes, overall_usage_daily) =
+        rate_limit_pair(response, "x-ratelimit-usage");
+    let (read_limit_15_minutes, read_limit_daily) =
+        rate_limit_pair(response, "x-readratelimit-limit");
+    let (read_usage_15_minutes, read_usage_daily) =
+        rate_limit_pair(response, "x-readratelimit-usage");
+    tracing::info!(
+        event = "strava_api_call",
+        endpoint,
+        status = response.status().as_u16(),
+        latency_ms = started.elapsed().as_millis() as u64,
+        overall_limit_15_minutes,
+        overall_limit_daily,
+        overall_usage_15_minutes,
+        overall_usage_daily,
+        read_limit_15_minutes,
+        read_limit_daily,
+        read_usage_15_minutes,
+        read_usage_daily,
+        "received a Strava API response"
+    );
+}
+
+fn rate_limit_pair(response: &reqwest::Response, header: &str) -> (i64, i64) {
+    let mut values = response
+        .headers()
+        .get(header)
+        .and_then(|value| value.to_str().ok())
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .filter_map(|value| value.trim().parse::<i64>().ok());
+    (values.next().unwrap_or(-1), values.next().unwrap_or(-1))
 }
 
 #[cfg(test)]

@@ -34,7 +34,11 @@ async fn main() -> Result<(), Error> {
         config.strava_client_id.clone(),
         config.strava_client_secret.clone(),
     );
-    let application = Application::new(Arc::new(store), Arc::new(provider));
+    let application = Application::new(
+        Arc::new(store),
+        Arc::new(provider),
+        config.sync_gate.clone(),
+    );
 
     let ctx = Arc::new(handler::Ctx {
         config,
