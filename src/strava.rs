@@ -163,6 +163,10 @@ struct DetailedActivityDto {
     elapsed_time: i64,
     distance: f64,
     #[serde(default)]
+    average_heartrate: Option<f64>,
+    #[serde(default)]
+    max_heartrate: Option<f64>,
+    #[serde(default)]
     laps: Vec<LapDto>,
 }
 
@@ -173,6 +177,10 @@ struct LapDto {
     moving_time: i64,
     elapsed_time: i64,
     distance: f64,
+    #[serde(default)]
+    average_heartrate: Option<f64>,
+    #[serde(default)]
+    max_heartrate: Option<f64>,
 }
 
 fn run_sport(value: &str) -> Option<RunSport> {
@@ -206,6 +214,8 @@ impl DetailedActivityDto {
                     lap.moving_time,
                     lap.elapsed_time,
                     lap.distance,
+                    lap.average_heartrate,
+                    lap.max_heartrate,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -219,6 +229,8 @@ impl DetailedActivityDto {
             duration_seconds: self.moving_time,
             elapsed_duration_seconds: self.elapsed_time,
             distance_meters: self.distance,
+            average_heart_rate_bpm: self.average_heartrate,
+            max_heart_rate_bpm: self.max_heartrate,
             laps,
         })?
         .into())
@@ -449,9 +461,11 @@ mod tests {
                 "id":7, "name":"Morning Run", "description":"Track session",
                 "workout_type":1, "sport_type":"Run", "start_date":"2026-07-15T06:00:00Z",
                 "moving_time":3600, "elapsed_time":3700, "distance":10050.5,
+                "average_heartrate":148.2, "max_heartrate":176.0,
                 "laps":[{
                     "lap_index":1, "name":"Lap 1", "moving_time":3600,
-                    "elapsed_time":3700, "distance":10050.5
+                    "elapsed_time":3700, "distance":10050.5,
+                    "average_heartrate":148.2, "max_heartrate":176.0
                 }]
             })))
             .mount(&server)
@@ -466,7 +480,10 @@ mod tests {
         assert_eq!(workouts[0].distance_meters, 10050.5);
         assert_eq!(workouts[0].description, "Track session");
         assert_eq!(workouts[0].workout_type, WorkoutType::Race);
+        assert_eq!(workouts[0].average_heart_rate_bpm, Some(148.2));
+        assert_eq!(workouts[0].max_heart_rate_bpm, Some(176.0));
         assert_eq!(workouts[0].laps[0].index, 1);
+        assert_eq!(workouts[0].laps[0].average_heart_rate_bpm, Some(148.2));
         assert!(!page.has_more);
     }
 

@@ -20,8 +20,9 @@ Routes:
 detailed `Run`, `TrailRun`, and `VirtualRun` activities. The initial window is
 one year and can be changed with `historyDays`. Each activity includes the
 selected original fields Lepre needs: identity, date, name, public description,
-sport, moving and elapsed duration, distance, and laps. The Lambda fetches this
-content transiently from Strava and never persists or classifies it.
+sport, workout/race type, moving and elapsed duration, distance, activity heart
+rate, and laps with their heart-rate aggregates. The Lambda fetches this content
+transiently from Strava and never persists it.
 Strava rate limits are returned as HTTP 429 with a retry interval so the browser
 can checkpoint, pause and resume the import.
 

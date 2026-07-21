@@ -132,6 +132,12 @@ pub struct Lap {
     pub moving_duration_seconds: i64,
     pub elapsed_duration_seconds: i64,
     pub distance_meters: f64,
+    pub average_heart_rate_bpm: Option<f64>,
+    pub max_heart_rate_bpm: Option<f64>,
+}
+
+fn valid_optional_measurement(value: Option<f64>) -> bool {
+    value.is_none_or(|measurement| measurement.is_finite() && measurement >= 0.0)
 }
 
 impl Lap {
@@ -141,6 +147,8 @@ impl Lap {
         moving_duration_seconds: i64,
         elapsed_duration_seconds: i64,
         distance_meters: f64,
+        average_heart_rate_bpm: Option<f64>,
+        max_heart_rate_bpm: Option<f64>,
     ) -> Result<Self, DomainError> {
         let name = name.into();
         if index < 1 || name.trim().is_empty() {
@@ -150,6 +158,8 @@ impl Lap {
             || elapsed_duration_seconds < 0
             || !distance_meters.is_finite()
             || distance_meters < 0.0
+            || !valid_optional_measurement(average_heart_rate_bpm)
+            || !valid_optional_measurement(max_heart_rate_bpm)
         {
             return Err(DomainError::InvalidMeasurement);
         }
@@ -159,6 +169,8 @@ impl Lap {
             moving_duration_seconds,
             elapsed_duration_seconds,
             distance_meters,
+            average_heart_rate_bpm,
+            max_heart_rate_bpm,
         })
     }
 }
@@ -174,6 +186,8 @@ pub struct Workout {
     pub duration_seconds: i64,
     pub elapsed_duration_seconds: i64,
     pub distance_meters: f64,
+    pub average_heart_rate_bpm: Option<f64>,
+    pub max_heart_rate_bpm: Option<f64>,
     pub laps: Vec<Lap>,
 }
 
@@ -187,6 +201,8 @@ pub struct WorkoutData {
     pub duration_seconds: i64,
     pub elapsed_duration_seconds: i64,
     pub distance_meters: f64,
+    pub average_heart_rate_bpm: Option<f64>,
+    pub max_heart_rate_bpm: Option<f64>,
     pub laps: Vec<Lap>,
 }
 
@@ -199,6 +215,8 @@ impl Workout {
             || data.elapsed_duration_seconds < 0
             || !data.distance_meters.is_finite()
             || data.distance_meters < 0.0
+            || !valid_optional_measurement(data.average_heart_rate_bpm)
+            || !valid_optional_measurement(data.max_heart_rate_bpm)
         {
             return Err(DomainError::InvalidMeasurement);
         }
@@ -212,6 +230,8 @@ impl Workout {
             duration_seconds: data.duration_seconds,
             elapsed_duration_seconds: data.elapsed_duration_seconds,
             distance_meters: data.distance_meters,
+            average_heart_rate_bpm: data.average_heart_rate_bpm,
+            max_heart_rate_bpm: data.max_heart_rate_bpm,
             laps: data.laps,
         })
     }
@@ -233,11 +253,16 @@ mod tests {
             duration_seconds: 3600,
             elapsed_duration_seconds: 3700,
             distance_meters: 10_000.0,
-            laps: vec![Lap::new(1, "Lap 1", 3600, 3700, 10_000.0).unwrap()],
+            average_heart_rate_bpm: Some(148.2),
+            max_heart_rate_bpm: Some(176.0),
+            laps: vec![
+                Lap::new(1, "Lap 1", 3600, 3700, 10_000.0, Some(148.2), Some(176.0)).unwrap(),
+            ],
         })
         .unwrap();
         assert_eq!(workout.duration_seconds, 3600);
         assert_eq!(workout.distance_meters, 10_000.0);
+        assert_eq!(workout.average_heart_rate_bpm, Some(148.2));
     }
 
     #[test]
@@ -252,6 +277,8 @@ mod tests {
             duration_seconds: -1,
             elapsed_duration_seconds: -1,
             distance_meters: f64::NAN,
+            average_heart_rate_bpm: Some(f64::NAN),
+            max_heart_rate_bpm: None,
             laps: Vec::new(),
         });
         assert_eq!(result.unwrap_err(), DomainError::InvalidMeasurement);

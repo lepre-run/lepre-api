@@ -373,6 +373,8 @@ struct WorkoutResponse {
     duration_seconds: i64,
     elapsed_duration_seconds: i64,
     distance_meters: f64,
+    average_heart_rate_bpm: Option<f64>,
+    max_heart_rate_bpm: Option<f64>,
     laps: Vec<LapResponse>,
 }
 
@@ -384,6 +386,8 @@ struct LapResponse {
     moving_duration_seconds: i64,
     elapsed_duration_seconds: i64,
     distance_meters: f64,
+    average_heart_rate_bpm: Option<f64>,
+    max_heart_rate_bpm: Option<f64>,
 }
 
 impl From<Workout> for WorkoutResponse {
@@ -398,6 +402,8 @@ impl From<Workout> for WorkoutResponse {
             duration_seconds: workout.duration_seconds,
             elapsed_duration_seconds: workout.elapsed_duration_seconds,
             distance_meters: workout.distance_meters,
+            average_heart_rate_bpm: workout.average_heart_rate_bpm,
+            max_heart_rate_bpm: workout.max_heart_rate_bpm,
             laps: workout
                 .laps
                 .into_iter()
@@ -407,6 +413,8 @@ impl From<Workout> for WorkoutResponse {
                     moving_duration_seconds: lap.moving_duration_seconds,
                     elapsed_duration_seconds: lap.elapsed_duration_seconds,
                     distance_meters: lap.distance_meters,
+                    average_heart_rate_bpm: lap.average_heart_rate_bpm,
+                    max_heart_rate_bpm: lap.max_heart_rate_bpm,
                 })
                 .collect(),
         }
@@ -605,7 +613,20 @@ mod tests {
                     duration_seconds: 3600,
                     elapsed_duration_seconds: 3700,
                     distance_meters: 10_050.5,
-                    laps: vec![crate::domain::Lap::new(1, "Lap 1", 3600, 3700, 10_050.5).unwrap()],
+                    average_heart_rate_bpm: Some(148.2),
+                    max_heart_rate_bpm: Some(176.0),
+                    laps: vec![
+                        crate::domain::Lap::new(
+                            1,
+                            "Lap 1",
+                            3600,
+                            3700,
+                            10_050.5,
+                            Some(148.2),
+                            Some(176.0),
+                        )
+                        .unwrap(),
+                    ],
                 })
                 .unwrap(),
             ],
@@ -621,7 +642,13 @@ mod tests {
         assert_eq!(value["upserted"][0]["distanceMeters"], 10_050.5);
         assert_eq!(value["upserted"][0]["description"], "Track session");
         assert_eq!(value["upserted"][0]["type"], "workout");
+        assert_eq!(value["upserted"][0]["averageHeartRateBpm"], 148.2);
+        assert_eq!(value["upserted"][0]["maxHeartRateBpm"], 176.0);
         assert_eq!(value["upserted"][0]["laps"][0]["index"], 1);
+        assert_eq!(
+            value["upserted"][0]["laps"][0]["averageHeartRateBpm"],
+            148.2
+        );
         assert_eq!(value["continuation"]["kind"], "complete");
         assert!(value["continuation"]["checkpoint"].is_string());
     }
