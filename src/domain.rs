@@ -29,6 +29,21 @@ impl RunSport {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkoutType {
+    Workout,
+    Race,
+}
+
+impl WorkoutType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Workout => "workout",
+            Self::Race => "race",
+        }
+    }
+}
+
 macro_rules! string_value {
     ($name:ident) => {
         #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -154,6 +169,7 @@ pub struct Workout {
     pub performed_at: String,
     pub name: String,
     pub description: String,
+    pub workout_type: WorkoutType,
     pub sport: RunSport,
     pub duration_seconds: i64,
     pub elapsed_duration_seconds: i64,
@@ -166,6 +182,7 @@ pub struct WorkoutData {
     pub performed_at: String,
     pub name: String,
     pub description: String,
+    pub workout_type: WorkoutType,
     pub sport: RunSport,
     pub duration_seconds: i64,
     pub elapsed_duration_seconds: i64,
@@ -190,6 +207,7 @@ impl Workout {
             performed_at: data.performed_at,
             name: data.name,
             description: data.description,
+            workout_type: data.workout_type,
             sport: data.sport,
             duration_seconds: data.duration_seconds,
             elapsed_duration_seconds: data.elapsed_duration_seconds,
@@ -210,6 +228,7 @@ mod tests {
             performed_at: "2026-07-15T06:00:00Z".to_owned(),
             name: "Morning Run".to_owned(),
             description: "Track session".to_owned(),
+            workout_type: WorkoutType::Workout,
             sport: RunSport::Run,
             duration_seconds: 3600,
             elapsed_duration_seconds: 3700,
@@ -228,6 +247,7 @@ mod tests {
             performed_at: "2026-07-15T06:00:00Z".to_owned(),
             name: "Morning Run".to_owned(),
             description: String::new(),
+            workout_type: WorkoutType::Workout,
             sport: RunSport::Run,
             duration_seconds: -1,
             elapsed_duration_seconds: -1,

@@ -13,7 +13,9 @@ use crate::application::{
     AuthorizedProviderAccount, Provider, ProviderCredentials, ProviderRateLimited,
     ProviderWorkoutPage,
 };
-use crate::domain::{ExternalAccountId, Lap, RunSport, Workout, WorkoutData, WorkoutId};
+use crate::domain::{
+    ExternalAccountId, Lap, RunSport, Workout, WorkoutData, WorkoutId, WorkoutType,
+};
 
 const AUTHORIZE_URL: &str = "https://www.strava.com/oauth/authorize";
 const TOKEN_URL: &str = "https://www.strava.com/oauth/token";
@@ -153,6 +155,8 @@ struct DetailedActivityDto {
     name: String,
     #[serde(default)]
     description: Option<String>,
+    #[serde(default)]
+    workout_type: Option<i64>,
     sport_type: String,
     start_date: String,
     moving_time: i64,
@@ -180,6 +184,13 @@ fn run_sport(value: &str) -> Option<RunSport> {
     }
 }
 
+fn run_workout_type(value: Option<i64>) -> WorkoutType {
+    match value {
+        Some(1) => WorkoutType::Race,
+        _ => WorkoutType::Workout,
+    }
+}
+
 impl DetailedActivityDto {
     fn into_domain(self) -> Result<Option<Workout>, anyhow::Error> {
         let Some(sport) = run_sport(&self.sport_type) else {
@@ -203,6 +214,7 @@ impl DetailedActivityDto {
             performed_at: self.start_date,
             name: self.name,
             description: self.description.unwrap_or_default(),
+            workout_type: run_workout_type(self.workout_type),
             sport,
             duration_seconds: self.moving_time,
             elapsed_duration_seconds: self.elapsed_time,
@@ -435,7 +447,7 @@ mod tests {
             .and(path("/activity/7"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id":7, "name":"Morning Run", "description":"Track session",
-                "sport_type":"Run", "start_date":"2026-07-15T06:00:00Z",
+                "workout_type":1, "sport_type":"Run", "start_date":"2026-07-15T06:00:00Z",
                 "moving_time":3600, "elapsed_time":3700, "distance":10050.5,
                 "laps":[{
                     "lap_index":1, "name":"Lap 1", "moving_time":3600,
@@ -453,8 +465,19 @@ mod tests {
         assert_eq!(workouts[0].duration_seconds, 3600);
         assert_eq!(workouts[0].distance_meters, 10050.5);
         assert_eq!(workouts[0].description, "Track session");
+        assert_eq!(workouts[0].workout_type, WorkoutType::Race);
         assert_eq!(workouts[0].laps[0].index, 1);
         assert!(!page.has_more);
+    }
+
+    #[test]
+    fn only_strava_races_are_normalized_as_races() {
+        assert_eq!(run_workout_type(Some(1)), WorkoutType::Race);
+        assert_eq!(run_workout_type(None), WorkoutType::Workout);
+        assert_eq!(run_workout_type(Some(0)), WorkoutType::Workout);
+        assert_eq!(run_workout_type(Some(2)), WorkoutType::Workout);
+        assert_eq!(run_workout_type(Some(3)), WorkoutType::Workout);
+        assert_eq!(run_workout_type(Some(99)), WorkoutType::Workout);
     }
 
     #[tokio::test]

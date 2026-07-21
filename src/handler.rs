@@ -367,6 +367,8 @@ struct WorkoutResponse {
     performed_at: String,
     name: String,
     description: String,
+    #[serde(rename = "type")]
+    workout_type: &'static str,
     sport: &'static str,
     duration_seconds: i64,
     elapsed_duration_seconds: i64,
@@ -391,6 +393,7 @@ impl From<Workout> for WorkoutResponse {
             performed_at: workout.performed_at,
             name: workout.name,
             description: workout.description,
+            workout_type: workout.workout_type.as_str(),
             sport: workout.sport.as_str(),
             duration_seconds: workout.duration_seconds,
             elapsed_duration_seconds: workout.elapsed_duration_seconds,
@@ -597,6 +600,7 @@ mod tests {
                     performed_at: "2026-07-15T06:00:00Z".to_owned(),
                     name: "Morning Run".to_owned(),
                     description: "Track session".to_owned(),
+                    workout_type: crate::domain::WorkoutType::Workout,
                     sport: crate::domain::RunSport::Run,
                     duration_seconds: 3600,
                     elapsed_duration_seconds: 3700,
@@ -616,6 +620,7 @@ mod tests {
         assert_eq!(value["upserted"][0]["durationSeconds"], 3600);
         assert_eq!(value["upserted"][0]["distanceMeters"], 10_050.5);
         assert_eq!(value["upserted"][0]["description"], "Track session");
+        assert_eq!(value["upserted"][0]["type"], "workout");
         assert_eq!(value["upserted"][0]["laps"][0]["index"], 1);
         assert_eq!(value["continuation"]["kind"], "complete");
         assert!(value["continuation"]["checkpoint"].is_string());
