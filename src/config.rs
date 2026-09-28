@@ -17,6 +17,7 @@ const SSM_NAMES: &[&str] = &[
     "/lepre/api/strava_client_secret",
     "/lepre/api/token_encryption_key",
     "/lepre/api/webhook_verify_token",
+    "/lepre/api/webhook_path_secret",
 ];
 
 /// Resolved configuration values. Constructed once; never mutated.
@@ -25,11 +26,17 @@ pub struct Config {
     pub strava_client_id: String,
     pub strava_client_secret: String,
     pub webhook_verify_token: String,
+    /// URL path segment shared with Strava when registering the subscription
+    /// callback (`/v1/webhooks/strava/{webhook_path_secret}`). Required on
+    /// every webhook GET/POST because Strava does not sign event bodies.
+    pub webhook_path_secret: String,
     pub table_name: String,
     /// 32-byte AES-256 key, decoded from the base64 SSM value.
     pub token_encryption_key: [u8; 32],
     pub key_version: i32,
     pub sync_gate: SyncGateConfig,
+    /// Process-local cap on authenticated webhook POSTs per rolling window.
+    pub webhook_rate_limit_per_minute: u64,
 }
 
 impl Config {
@@ -84,6 +91,16 @@ impl Config {
         };
 
         let webhook_verify_token = take("/lepre/api/webhook_verify_token")?;
+        let webhook_path_secret = take("/lepre/api/webhook_path_secret")?;
+        if webhook_path_secret.is_empty()
+            || webhook_path_secret.contains('/')
+            || webhook_path_secret.contains('?')
+            || webhook_path_secret.contains('#')
+        {
+            return Err(anyhow!(
+                "webhook_path_secret must be a non-empty single URL path segment"
+            ));
+        }
         let key_b64 = take("/lepre/api/token_encryption_key")?;
 
         let key_bytes = base64::engine::general_purpose::STANDARD
@@ -109,14 +126,22 @@ impl Config {
             return Err(anyhow!("invalid synchronization gate configuration"));
         }
 
+        let webhook_rate_limit_per_minute =
+            environment_integer("WEBHOOK_RATE_LIMIT_PER_MINUTE", 120)? as u64;
+        if webhook_rate_limit_per_minute == 0 {
+            return Err(anyhow!("WEBHOOK_RATE_LIMIT_PER_MINUTE must be >= 1"));
+        }
+
         Ok(Self {
             strava_client_id,
             strava_client_secret,
             webhook_verify_token,
+            webhook_path_secret,
             table_name: std::env::var("LEPRE_TABLE_NAME").unwrap_or_else(|_| "lepre".to_owned()),
             token_encryption_key,
             key_version: 1,
             sync_gate,
+            webhook_rate_limit_per_minute,
         })
     }
 
@@ -147,13 +172,19 @@ mod tests {
         h.insert("/lepre/api/strava_client_secret".into(), "csec".into());
         h.insert("/lepre/api/token_encryption_key".into(), b64_32());
         h.insert("/lepre/api/webhook_verify_token".into(), "verify".into());
+        h.insert(
+            "/lepre/api/webhook_path_secret".into(),
+            "path-secret".into(),
+        );
 
         let cfg = Config::from_values(&mut h).unwrap();
         assert_eq!(cfg.strava_client_id, "clid");
         assert_eq!(cfg.strava_client_secret, "csec");
         assert_eq!(cfg.webhook_verify_token, "verify");
+        assert_eq!(cfg.webhook_path_secret, "path-secret");
         assert_eq!(cfg.token_encryption_key, [7u8; 32]);
         assert_eq!(cfg.key_version, 1);
+        assert_eq!(cfg.webhook_rate_limit_per_minute, 120);
     }
 
     #[test]
@@ -178,9 +209,28 @@ mod tests {
             base64::engine::general_purpose::STANDARD.encode([1u8; 16]),
         );
         h.insert("/lepre/api/webhook_verify_token".into(), "verify".into());
+        h.insert(
+            "/lepre/api/webhook_path_secret".into(),
+            "path-secret".into(),
+        );
         let err = Config::from_values(&mut h).unwrap_err();
         assert!(
             err.to_string().contains("32 bytes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn from_values_errors_on_invalid_webhook_path_secret() {
+        let mut h = HashMap::new();
+        h.insert("/lepre/api/strava_client_id".into(), "clid".into());
+        h.insert("/lepre/api/strava_client_secret".into(), "csec".into());
+        h.insert("/lepre/api/token_encryption_key".into(), b64_32());
+        h.insert("/lepre/api/webhook_verify_token".into(), "verify".into());
+        h.insert("/lepre/api/webhook_path_secret".into(), "bad/secret".into());
+        let err = Config::from_values(&mut h).unwrap_err();
+        assert!(
+            err.to_string().contains("webhook_path_secret"),
             "unexpected error: {err}"
         );
     }
