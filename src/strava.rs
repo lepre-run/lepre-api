@@ -200,17 +200,37 @@ fn run_workout_type(value: Option<i64>) -> WorkoutType {
 }
 
 impl DetailedActivityDto {
+    /// Map a Strava detailed activity into a domain workout.
+    ///
+    /// Empty optional string fields from Strava (`name`, lap `name`) are
+    /// normalized to safe defaults with a WARN that names the field only.
+    /// An empty `start_date` skips the activity (WARN) instead of failing the
+    /// whole sync page with `domain value cannot be empty`.
     fn into_domain(self) -> Result<Option<Workout>, anyhow::Error> {
         let Some(sport) = run_sport(&self.sport_type) else {
             return Ok(None);
         };
+        let performed_at = self.start_date.trim().to_owned();
+        if performed_at.is_empty() {
+            tracing::warn!(
+                event = "strava_activity_skipped",
+                field = "start_date",
+                activity_id = self.id,
+                "skipping Strava activity with empty required field"
+            );
+            return Ok(None);
+        }
+        let name = nonempty_or_default(self.name, "name", self.id, "Untitled");
         let laps = self
             .laps
             .into_iter()
             .map(|lap| {
+                let index = lap.lap_index;
+                let lap_name =
+                    nonempty_or_default(lap.name, "laps[].name", self.id, format!("Lap {index}"));
                 Lap::new(
-                    lap.lap_index,
-                    lap.name,
+                    index,
+                    lap_name,
                     lap.moving_time,
                     lap.elapsed_time,
                     lap.distance,
@@ -221,8 +241,8 @@ impl DetailedActivityDto {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Workout::new(WorkoutData {
             id: WorkoutId::new(format!("strava:{}", self.id))?,
-            performed_at: self.start_date,
-            name: self.name,
+            performed_at,
+            name,
             description: self.description.unwrap_or_default(),
             workout_type: run_workout_type(self.workout_type),
             sport,
@@ -234,6 +254,27 @@ impl DetailedActivityDto {
             laps,
         })?
         .into())
+    }
+}
+
+/// Trim `value`; if empty, WARN with the Strava field name and return `default`.
+fn nonempty_or_default(
+    value: impl Into<String>,
+    field: &'static str,
+    activity_id: i64,
+    default: impl Into<String>,
+) -> String {
+    let trimmed = value.into().trim().to_owned();
+    if trimmed.is_empty() {
+        tracing::warn!(
+            event = "strava_empty_optional_field",
+            field,
+            activity_id,
+            "empty Strava optional field; using default"
+        );
+        default.into()
+    } else {
+        trimmed
     }
 }
 
@@ -554,6 +595,94 @@ mod tests {
         assert_eq!(run_workout_type(Some(2)), WorkoutType::Workout);
         assert_eq!(run_workout_type(Some(3)), WorkoutType::Workout);
         assert_eq!(run_workout_type(Some(99)), WorkoutType::Workout);
+    }
+
+    #[tokio::test]
+    async fn empty_optional_activity_and_lap_names_use_defaults() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/activities"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "id":9, "sport_type":"Run"
+                }])),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/activity/9"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id":9, "name":"  ", "description":null,
+                "workout_type":0, "sport_type":"Run", "start_date":"2026-09-01T07:00:00Z",
+                "moving_time":1800, "elapsed_time":1900, "distance":5000.0,
+                "laps":[{
+                    "lap_index":1, "name":"", "moving_time":1800,
+                    "elapsed_time":1900, "distance":5000.0
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let page = StravaProvider::with_base_url(&server.uri())
+            .workouts("token", 0, 1_800_000_000, 1)
+            .await
+            .unwrap();
+        assert_eq!(page.workouts.len(), 1);
+        assert_eq!(page.workouts[0].id.as_str(), "strava:9");
+        assert_eq!(page.workouts[0].name, "Untitled");
+        assert_eq!(page.workouts[0].description, "");
+        assert_eq!(page.workouts[0].laps[0].name, "Lap 1");
+    }
+
+    #[tokio::test]
+    async fn empty_start_date_skips_activity_instead_of_failing_sync() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/activities"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "id":10, "sport_type":"Run"
+                }])),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/activity/10"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id":10, "name":"Ghost Run", "sport_type":"Run", "start_date":"   ",
+                "moving_time":600, "elapsed_time":600, "distance":1000.0,
+                "laps":[]
+            })))
+            .mount(&server)
+            .await;
+        let page = StravaProvider::with_base_url(&server.uri())
+            .workouts("token", 0, 1_800_000_000, 1)
+            .await
+            .unwrap();
+        assert!(page.workouts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn omitted_activity_name_field_deserializes_empty_and_defaults() {
+        // Strava sometimes returns "" for name; serde default keeps missing as error
+        // for required String, so exercise the empty-string path explicitly via detail.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/activity/11"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id":11, "name":"", "sport_type":"TrailRun",
+                "start_date":"2026-09-02T08:00:00Z",
+                "moving_time":900, "elapsed_time":950, "distance":3000.0,
+                "laps":[]
+            })))
+            .mount(&server)
+            .await;
+        let workout = StravaProvider::with_base_url(&server.uri())
+            .workout("token", 11)
+            .await
+            .unwrap()
+            .expect("mapped workout");
+        assert_eq!(workout.name, "Untitled");
+        assert_eq!(workout.sport, RunSport::TrailRun);
     }
 
     #[tokio::test]
