@@ -14,7 +14,7 @@ use crate::application::{
     ProviderWorkoutPage,
 };
 use crate::domain::{
-    ExternalAccountId, Lap, RunSport, Workout, WorkoutData, WorkoutId, WorkoutType,
+    DomainError, ExternalAccountId, Lap, RunSport, Workout, WorkoutData, WorkoutId, WorkoutType,
 };
 
 const AUTHORIZE_URL: &str = "https://www.strava.com/oauth/authorize";
@@ -152,6 +152,7 @@ struct SummaryActivityDto {
 #[derive(Deserialize)]
 struct DetailedActivityDto {
     id: i64,
+    #[serde(default)]
     name: String,
     #[serde(default)]
     description: Option<String>,
@@ -173,6 +174,7 @@ struct DetailedActivityDto {
 #[derive(Deserialize)]
 struct LapDto {
     lap_index: i64,
+    #[serde(default)]
     name: String,
     moving_time: i64,
     elapsed_time: i64,
@@ -204,24 +206,21 @@ impl DetailedActivityDto {
     ///
     /// Empty optional string fields from Strava (`name`, lap `name`) are
     /// normalized to safe defaults with a WARN that names the field only.
-    /// An empty `start_date` skips the activity (WARN) instead of failing the
-    /// whole sync page with `domain value cannot be empty`.
+    /// Empty `start_date`, `lap_index < 1`, and invalid measurements skip the
+    /// activity (WARN with field/reason) instead of failing the whole sync page.
     fn into_domain(self) -> Result<Option<Workout>, anyhow::Error> {
         let Some(sport) = run_sport(&self.sport_type) else {
             return Ok(None);
         };
         let performed_at = self.start_date.trim().to_owned();
         if performed_at.is_empty() {
-            tracing::warn!(
-                event = "strava_activity_skipped",
-                field = "start_date",
-                activity_id = self.id,
-                "skipping Strava activity with empty required field"
-            );
-            return Ok(None);
+            return skip_activity(self.id, "start_date", "empty_value");
+        }
+        if self.laps.iter().any(|lap| lap.lap_index < 1) {
+            return skip_activity(self.id, "laps[].lap_index", "lap_index_lt_1");
         }
         let name = nonempty_or_default(self.name, "name", self.id, "Untitled");
-        let laps = self
+        let laps = match self
             .laps
             .into_iter()
             .map(|lap| {
@@ -238,8 +237,17 @@ impl DetailedActivityDto {
                     lap.max_heartrate,
                 )
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Workout::new(WorkoutData {
+            .collect::<Result<Vec<_>, DomainError>>()
+        {
+            Ok(laps) => laps,
+            Err(DomainError::EmptyValue) => {
+                return skip_activity(self.id, "laps", "empty_value");
+            }
+            Err(DomainError::InvalidMeasurement) => {
+                return skip_activity(self.id, "laps", "invalid_measurement");
+            }
+        };
+        match Workout::new(WorkoutData {
             id: WorkoutId::new(format!("strava:{}", self.id))?,
             performed_at,
             name,
@@ -252,9 +260,30 @@ impl DetailedActivityDto {
             average_heart_rate_bpm: self.average_heartrate,
             max_heart_rate_bpm: self.max_heartrate,
             laps,
-        })?
-        .into())
+        }) {
+            Ok(workout) => Ok(Some(workout)),
+            Err(DomainError::EmptyValue) => skip_activity(self.id, "activity", "empty_value"),
+            Err(DomainError::InvalidMeasurement) => {
+                skip_activity(self.id, "measurement", "invalid_measurement")
+            }
+        }
     }
+}
+
+/// Skip one activity after a domain reject; WARN with field/reason only (no PII).
+fn skip_activity(
+    activity_id: i64,
+    field: &'static str,
+    reason: &'static str,
+) -> Result<Option<Workout>, anyhow::Error> {
+    tracing::warn!(
+        event = "strava_activity_skipped",
+        field,
+        reason,
+        activity_id,
+        "skipping Strava activity rejected by domain mapping"
+    );
+    Ok(None)
 }
 
 /// Trim `value`; if empty, WARN with the Strava field name and return `default`.
@@ -663,13 +692,12 @@ mod tests {
 
     #[tokio::test]
     async fn omitted_activity_name_field_deserializes_empty_and_defaults() {
-        // Strava sometimes returns "" for name; serde default keeps missing as error
-        // for required String, so exercise the empty-string path explicitly via detail.
+        // Omitted `name` deserializes via #[serde(default)] then defaults to Untitled.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/activity/11"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id":11, "name":"", "sport_type":"TrailRun",
+                "id":11, "sport_type":"TrailRun",
                 "start_date":"2026-09-02T08:00:00Z",
                 "moving_time":900, "elapsed_time":950, "distance":3000.0,
                 "laps":[]
@@ -683,6 +711,107 @@ mod tests {
             .expect("mapped workout");
         assert_eq!(workout.name, "Untitled");
         assert_eq!(workout.sport, RunSport::TrailRun);
+    }
+
+    #[tokio::test]
+    async fn lap_index_below_one_skips_activity_instead_of_failing_sync() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/activities"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id":12, "sport_type":"Run"},
+                {"id":13, "sport_type":"Run"}
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/activity/12"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id":12, "name":"Bad Lap Index", "sport_type":"Run",
+                "start_date":"2026-09-03T07:00:00Z",
+                "moving_time":600, "elapsed_time":600, "distance":1000.0,
+                "laps":[{
+                    "lap_index":0, "name":"Lap 0", "moving_time":600,
+                    "elapsed_time":600, "distance":1000.0
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/activity/13"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id":13, "name":"Good Run", "sport_type":"Run",
+                "start_date":"2026-09-03T08:00:00Z",
+                "moving_time":900, "elapsed_time":900, "distance":2000.0,
+                "laps":[{
+                    "lap_index":1, "name":"Lap 1", "moving_time":900,
+                    "elapsed_time":900, "distance":2000.0
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let page = StravaProvider::with_base_url(&server.uri())
+            .workouts("token", 0, 1_800_000_000, 1)
+            .await
+            .unwrap();
+        assert_eq!(page.workouts.len(), 1);
+        assert_eq!(page.workouts[0].id.as_str(), "strava:13");
+    }
+
+    #[tokio::test]
+    async fn invalid_measurement_skips_activity_instead_of_failing_sync() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/activities"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id":14, "sport_type":"Run"},
+                {"id":15, "sport_type":"Run"},
+                {"id":16, "sport_type":"Run"}
+            ])))
+            .mount(&server)
+            .await;
+        // Activity-level InvalidMeasurement (negative duration).
+        Mock::given(method("GET"))
+            .and(path("/activity/14"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id":14, "name":"Negative Duration", "sport_type":"Run",
+                "start_date":"2026-09-04T07:00:00Z",
+                "moving_time":-1, "elapsed_time":600, "distance":1000.0,
+                "laps":[]
+            })))
+            .mount(&server)
+            .await;
+        // Lap-level InvalidMeasurement (negative lap moving_time).
+        Mock::given(method("GET"))
+            .and(path("/activity/15"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id":15, "name":"Bad Lap Measurement", "sport_type":"Run",
+                "start_date":"2026-09-04T08:00:00Z",
+                "moving_time":1200, "elapsed_time":1200, "distance":4000.0,
+                "laps":[{
+                    "lap_index":1, "name":"Lap 1", "moving_time":-1,
+                    "elapsed_time":1200, "distance":4000.0
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/activity/16"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id":16, "name":"Valid Sibling", "sport_type":"Run",
+                "start_date":"2026-09-04T09:00:00Z",
+                "moving_time":300, "elapsed_time":300, "distance":800.0,
+                "laps":[]
+            })))
+            .mount(&server)
+            .await;
+        let page = StravaProvider::with_base_url(&server.uri())
+            .workouts("token", 0, 1_800_000_000, 1)
+            .await
+            .unwrap();
+        assert_eq!(page.workouts.len(), 1);
+        assert_eq!(page.workouts[0].id.as_str(), "strava:16");
+        assert_eq!(page.workouts[0].name, "Valid Sibling");
     }
 
     #[tokio::test]
