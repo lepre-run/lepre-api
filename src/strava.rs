@@ -206,8 +206,12 @@ impl DetailedActivityDto {
     ///
     /// Empty optional string fields from Strava (`name`, lap `name`) are
     /// normalized to safe defaults with a WARN that names the field only.
-    /// Empty `start_date`, `lap_index < 1`, and invalid measurements skip the
-    /// activity (WARN with field/reason) instead of failing the whole sync page.
+    /// Empty `start_date` and invalid measurements skip the activity (WARN with
+    /// field/reason) instead of failing the whole sync page.
+    ///
+    /// Strava `lap_index` is 0-based; domain `Lap::new` requires `index >= 1`,
+    /// so the adapter remaps with `index = lap.lap_index + 1`. Negative Strava
+    /// indices still fail domain validation and skip the activity.
     fn into_domain(self) -> Result<Option<Workout>, anyhow::Error> {
         let Some(sport) = run_sport(&self.sport_type) else {
             return Ok(None);
@@ -216,15 +220,13 @@ impl DetailedActivityDto {
         if performed_at.is_empty() {
             return skip_activity(self.id, "start_date", "empty_value");
         }
-        if self.laps.iter().any(|lap| lap.lap_index < 1) {
-            return skip_activity(self.id, "laps[].lap_index", "lap_index_lt_1");
-        }
         let name = nonempty_or_default(self.name, "name", self.id, "Untitled");
         let laps = match self
             .laps
             .into_iter()
             .map(|lap| {
-                let index = lap.lap_index;
+                // Strava lap_index starts at 0; domain Lap index is 1-based.
+                let index = lap.lap_index + 1;
                 let lap_name =
                     nonempty_or_default(lap.name, "laps[].name", self.id, format!("Lap {index}"));
                 Lap::new(
@@ -592,7 +594,7 @@ mod tests {
                 "moving_time":3600, "elapsed_time":3700, "distance":10050.5,
                 "average_heartrate":148.2, "max_heartrate":176.0,
                 "laps":[{
-                    "lap_index":1, "name":"Lap 1", "moving_time":3600,
+                    "lap_index":0, "name":"Lap 1", "moving_time":3600,
                     "elapsed_time":3700, "distance":10050.5,
                     "average_heartrate":148.2, "max_heartrate":176.0
                 }]
@@ -645,7 +647,7 @@ mod tests {
                 "workout_type":0, "sport_type":"Run", "start_date":"2026-09-01T07:00:00Z",
                 "moving_time":1800, "elapsed_time":1900, "distance":5000.0,
                 "laps":[{
-                    "lap_index":1, "name":"", "moving_time":1800,
+                    "lap_index":0, "name":"", "moving_time":1800,
                     "elapsed_time":1900, "distance":5000.0
                 }]
             })))
@@ -714,7 +716,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lap_index_below_one_skips_activity_instead_of_failing_sync() {
+    async fn zero_based_strava_lap_index_imports_as_domain_index_one() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/activities"))
@@ -724,10 +726,11 @@ mod tests {
             ])))
             .mount(&server)
             .await;
+        // Strava first lap uses lap_index 0; adapter remaps to domain index 1.
         Mock::given(method("GET"))
             .and(path("/activity/12"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id":12, "name":"Bad Lap Index", "sport_type":"Run",
+                "id":12, "name":"Zero-Based Lap", "sport_type":"Run",
                 "start_date":"2026-09-03T07:00:00Z",
                 "moving_time":600, "elapsed_time":600, "distance":1000.0,
                 "laps":[{
@@ -740,11 +743,11 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/activity/13"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id":13, "name":"Good Run", "sport_type":"Run",
+                "id":13, "name":"Second Lap Also Zero-Based", "sport_type":"Run",
                 "start_date":"2026-09-03T08:00:00Z",
                 "moving_time":900, "elapsed_time":900, "distance":2000.0,
                 "laps":[{
-                    "lap_index":1, "name":"Lap 1", "moving_time":900,
+                    "lap_index":0, "name":"Lap 1", "moving_time":900,
                     "elapsed_time":900, "distance":2000.0
                 }]
             })))
@@ -754,8 +757,11 @@ mod tests {
             .workouts("token", 0, 1_800_000_000, 1)
             .await
             .unwrap();
-        assert_eq!(page.workouts.len(), 1);
-        assert_eq!(page.workouts[0].id.as_str(), "strava:13");
+        assert_eq!(page.workouts.len(), 2);
+        assert_eq!(page.workouts[0].id.as_str(), "strava:12");
+        assert_eq!(page.workouts[0].laps[0].index, 1);
+        assert_eq!(page.workouts[1].id.as_str(), "strava:13");
+        assert_eq!(page.workouts[1].laps[0].index, 1);
     }
 
     #[tokio::test]
@@ -789,7 +795,7 @@ mod tests {
                 "start_date":"2026-09-04T08:00:00Z",
                 "moving_time":1200, "elapsed_time":1200, "distance":4000.0,
                 "laps":[{
-                    "lap_index":1, "name":"Lap 1", "moving_time":-1,
+                    "lap_index":0, "name":"Lap 1", "moving_time":-1,
                     "elapsed_time":1200, "distance":4000.0
                 }]
             })))
