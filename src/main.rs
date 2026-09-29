@@ -40,9 +40,11 @@ async fn main() -> Result<(), Error> {
         config.sync_gate.clone(),
     );
 
+    let webhook_rate_limit = handler::WebhookRateLimit::new(config.webhook_rate_limit_per_minute);
     let ctx = Arc::new(handler::Ctx {
         config,
         application,
+        webhook_rate_limit,
     });
 
     lambda_http::run(service_fn(move |req| {

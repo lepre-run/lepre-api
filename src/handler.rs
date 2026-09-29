@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
@@ -26,14 +27,54 @@ const APP_ORIGIN: &str = "https://lepre.run";
 const DEFAULT_HISTORY_DAYS: i64 = 365;
 const MAX_HISTORY_DAYS: i64 = 3_650;
 
+const STRAVA_WEBHOOK_PREFIX: &str = "/v1/webhooks/strava/";
+const WEBHOOK_ASPECT_CREATE: &str = "create";
+const WEBHOOK_ASPECT_UPDATE: &str = "update";
+const WEBHOOK_ASPECT_DELETE: &str = "delete";
+const WEBHOOK_RATE_WINDOW_MS: i64 = 60_000;
+
+/// Process-local rolling window for authenticated webhook POSTs.
+///
+/// Caps DynamoDB/event work if the path secret leaks. Not shared across
+/// Lambda instances; combine with API Gateway stage throttling in production.
+pub struct WebhookRateLimit {
+    window_start_ms: AtomicI64,
+    count: AtomicU64,
+    max_per_window: u64,
+}
+
+impl WebhookRateLimit {
+    pub fn new(max_per_window: u64) -> Self {
+        Self {
+            window_start_ms: AtomicI64::new(0),
+            count: AtomicU64::new(0),
+            max_per_window,
+        }
+    }
+
+    /// Returns `true` when the request is admitted.
+    pub fn admit(&self, now_ms: i64) -> bool {
+        let window_start = self.window_start_ms.load(Ordering::Relaxed);
+        if now_ms - window_start >= WEBHOOK_RATE_WINDOW_MS {
+            self.window_start_ms.store(now_ms, Ordering::Relaxed);
+            self.count.store(1, Ordering::Relaxed);
+            return true;
+        }
+        let prior = self.count.fetch_add(1, Ordering::Relaxed);
+        prior < self.max_per_window
+    }
+}
+
 pub struct Ctx {
     pub config: Config,
     pub application: Application,
+    pub webhook_rate_limit: WebhookRateLimit,
 }
 
 pub async fn route(req: Request, ctx: Arc<Ctx>) -> Result<Response<Body>, lambda_http::Error> {
     let method = req.method().clone();
-    let response = match (&method, req.uri().path()) {
+    let path = req.uri().path();
+    let response = match (&method, path) {
         (&Method::OPTIONS, _) => empty(StatusCode::NO_CONTENT),
         (&Method::GET, "/v1/healthz") => json(StatusCode::OK, &serde_json::json!({"ok": true})),
         (&Method::GET, "/v1/auth/strava/start") => provider_start(&ctx),
@@ -41,8 +82,12 @@ pub async fn route(req: Request, ctx: Arc<Ctx>) -> Result<Response<Body>, lambda
         (&Method::GET, "/v1/session") => session(&req, &ctx).await,
         (&Method::GET, "/v1/workouts") => workouts(&req, &ctx).await,
         (&Method::POST, "/v1/disconnect") => disconnect(&req, &ctx).await,
-        (&Method::GET, "/v1/webhooks/strava") => verify_webhook(&req, &ctx.config),
-        (&Method::POST, "/v1/webhooks/strava") => receive_webhook(&req, &ctx).await,
+        (&Method::GET, path) if is_strava_webhook_path(path) => {
+            verify_webhook(&req, &ctx.config, path)
+        }
+        (&Method::POST, path) if is_strava_webhook_path(path) => {
+            receive_webhook(&req, &ctx, path).await
+        }
         _ => json(
             StatusCode::NOT_FOUND,
             &serde_json::json!({"error":"not_found","code":404}),
@@ -178,7 +223,13 @@ struct WebhookVerification {
     challenge: String,
 }
 
-fn verify_webhook(req: &Request, config: &Config) -> Response<Body> {
+fn verify_webhook(req: &Request, config: &Config, path: &str) -> Response<Body> {
+    if !webhook_path_authorized(path, &config.webhook_path_secret) {
+        return json(
+            StatusCode::NOT_FOUND,
+            &serde_json::json!({"error":"not_found","code":404}),
+        );
+    }
     let query: WebhookVerification =
         match serde_urlencoded::from_str(req.uri().query().unwrap_or("")) {
             Ok(query) => query,
@@ -189,7 +240,13 @@ fn verify_webhook(req: &Request, config: &Config) -> Response<Body> {
                 );
             }
         };
-    if query.mode != "subscribe" || query.verify_token != config.webhook_verify_token {
+    let token_ok = bool::from(
+        query
+            .verify_token
+            .as_bytes()
+            .ct_eq(config.webhook_verify_token.as_bytes()),
+    );
+    if query.mode != "subscribe" || !token_ok {
         return json(
             StatusCode::FORBIDDEN,
             &serde_json::json!({"error":"verification_failed"}),
@@ -211,7 +268,28 @@ struct WebhookPayload {
     updates: HashMap<String, serde_json::Value>,
 }
 
-async fn receive_webhook(req: &Request, ctx: &Ctx) -> Response<Body> {
+async fn receive_webhook(req: &Request, ctx: &Ctx, path: &str) -> Response<Body> {
+    if !webhook_path_authorized(path, &ctx.config.webhook_path_secret) {
+        return json(
+            StatusCode::NOT_FOUND,
+            &serde_json::json!({"error":"not_found","code":404}),
+        );
+    }
+    let now = now_millis();
+    if !ctx.webhook_rate_limit.admit(now) {
+        tracing::warn!("webhook rate limit exceeded");
+        let mut response = json(
+            StatusCode::TOO_MANY_REQUESTS,
+            &serde_json::json!({
+                "error":"webhook_rate_limited",
+                "retryAfterSeconds":60
+            }),
+        );
+        response
+            .headers_mut()
+            .insert(RETRY_AFTER, "60".parse().expect("valid retry-after header"));
+        return response;
+    }
     let payload: WebhookPayload = match serde_json::from_slice(body_bytes(req)) {
         Ok(payload) => payload,
         Err(_) => {
@@ -221,34 +299,66 @@ async fn receive_webhook(req: &Request, ctx: &Ctx) -> Response<Body> {
             );
         }
     };
-    let external_account_id = match ExternalAccountId::new(payload.owner_id.to_string()) {
-        Ok(value) => value,
-        Err(error) => return application_error(ApplicationError::Domain(error)),
-    };
-    let event = if payload.object_type == "athlete"
-        && payload
-            .updates
-            .get("authorized")
-            .and_then(|value| value.as_str())
-            == Some("false")
-    {
-        WebhookEvent::AuthorizationRevoked {
-            external_account_id,
-        }
-    } else if payload.object_type == "activity" {
-        WebhookEvent::WorkoutChanged {
-            external_account_id,
-            external_workout_id: payload.object_id,
-            aspect: payload.aspect_type,
-            received_at_millis: now_millis(),
-        }
-    } else {
+    let Some(event) = webhook_event_from_payload(payload, now) else {
         return json(StatusCode::OK, &serde_json::json!({}));
     };
     match ctx.application.record_webhook(event).await {
         Ok(()) => json(StatusCode::OK, &serde_json::json!({})),
         Err(error) => application_error(error),
     }
+}
+
+fn is_strava_webhook_path(path: &str) -> bool {
+    path.starts_with(STRAVA_WEBHOOK_PREFIX)
+}
+
+fn webhook_path_secret(path: &str) -> Option<&str> {
+    let secret = path.strip_prefix(STRAVA_WEBHOOK_PREFIX)?;
+    if secret.is_empty() || secret.contains('/') {
+        return None;
+    }
+    Some(secret)
+}
+
+fn webhook_path_authorized(path: &str, expected: &str) -> bool {
+    match webhook_path_secret(path) {
+        Some(provided) => bool::from(provided.as_bytes().ct_eq(expected.as_bytes())),
+        None => false,
+    }
+}
+
+fn known_activity_aspect(aspect: &str) -> bool {
+    matches!(
+        aspect,
+        WEBHOOK_ASPECT_CREATE | WEBHOOK_ASPECT_UPDATE | WEBHOOK_ASPECT_DELETE
+    )
+}
+
+fn webhook_event_from_payload(
+    payload: WebhookPayload,
+    received_at_millis: i64,
+) -> Option<WebhookEvent> {
+    let external_account_id = ExternalAccountId::new(payload.owner_id.to_string()).ok()?;
+    if payload.object_type == "athlete"
+        && payload
+            .updates
+            .get("authorized")
+            .and_then(|value| value.as_str())
+            == Some("false")
+    {
+        return Some(WebhookEvent::AuthorizationRevoked {
+            external_account_id,
+        });
+    }
+    if payload.object_type == "activity" && known_activity_aspect(&payload.aspect_type) {
+        return Some(WebhookEvent::WorkoutChanged {
+            external_account_id,
+            external_workout_id: payload.object_id,
+            aspect: payload.aspect_type,
+            received_at_millis,
+        });
+    }
+    None
 }
 
 #[derive(Default, Deserialize)]
@@ -620,8 +730,17 @@ fn clear_session(mut response: Response<Body>) -> Response<Body> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::SyncBatch;
-    use crate::domain::{WorkoutData, WorkoutId};
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+
+    use crate::application::{
+        Provider, ProviderCredentials, ProviderEvent, ProviderWorkoutPage, Repository,
+        StoredProviderConnection, SyncBatch, SyncGateConfig, SyncTurn,
+    };
+    use crate::domain::{
+        ConnectionId, ProviderConnection, ProviderId, UserId, Workout, WorkoutData, WorkoutId,
+    };
 
     #[test]
     fn synchronization_tokens_roundtrip_without_nullable_fields() {
@@ -728,5 +847,450 @@ mod tests {
         };
         assert!(body.contains("queued"));
         assert!(body.contains("retryAfterSeconds"));
+    }
+
+    #[test]
+    fn webhook_path_secret_requires_single_segment() {
+        assert_eq!(webhook_path_secret("/v1/webhooks/strava/abc"), Some("abc"));
+        assert_eq!(webhook_path_secret("/v1/webhooks/strava/"), None);
+        assert_eq!(webhook_path_secret("/v1/webhooks/strava"), None);
+        assert_eq!(webhook_path_secret("/v1/webhooks/strava/a/b"), None);
+        assert!(webhook_path_authorized(
+            "/v1/webhooks/strava/expected",
+            "expected"
+        ));
+        assert!(!webhook_path_authorized(
+            "/v1/webhooks/strava/wrong",
+            "expected"
+        ));
+    }
+
+    #[test]
+    fn unknown_activity_aspects_are_dropped() {
+        let payload = WebhookPayload {
+            object_type: "activity".into(),
+            object_id: 9,
+            aspect_type: "comment".into(),
+            owner_id: 42,
+            updates: HashMap::new(),
+        };
+        assert!(webhook_event_from_payload(payload, 1).is_none());
+    }
+
+    #[test]
+    fn known_activity_aspects_are_accepted() {
+        for aspect in ["create", "update", "delete"] {
+            let payload = WebhookPayload {
+                object_type: "activity".into(),
+                object_id: 9,
+                aspect_type: aspect.into(),
+                owner_id: 42,
+                updates: HashMap::new(),
+            };
+            let event = webhook_event_from_payload(payload, 7).unwrap();
+            match event {
+                WebhookEvent::WorkoutChanged {
+                    external_workout_id,
+                    aspect: got,
+                    received_at_millis,
+                    ..
+                } => {
+                    assert_eq!(external_workout_id, 9);
+                    assert_eq!(got, aspect);
+                    assert_eq!(received_at_millis, 7);
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reject_unauth_revoke_without_path_secret() {
+        let repo = Arc::new(MockRepository::with_connection(sample_connection()));
+        let ctx = test_ctx(Arc::clone(&repo), 120);
+        let body = serde_json::json!({
+            "object_type": "athlete",
+            "object_id": 42,
+            "aspect_type": "update",
+            "owner_id": 42,
+            "updates": {"authorized": "false"}
+        });
+        let req = http::Request::builder()
+            .method(Method::POST)
+            .uri("/v1/webhooks/strava")
+            .body(Body::Text(body.to_string()))
+            .unwrap();
+        let response = route(req, ctx).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(repo.deleted.lock().unwrap().is_empty());
+        assert!(repo.events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reject_unauth_revoke_with_wrong_path_secret() {
+        let repo = Arc::new(MockRepository::with_connection(sample_connection()));
+        let ctx = test_ctx(Arc::clone(&repo), 120);
+        let body = serde_json::json!({
+            "object_type": "athlete",
+            "object_id": 42,
+            "aspect_type": "update",
+            "owner_id": 42,
+            "updates": {"authorized": "false"}
+        });
+        let req = http::Request::builder()
+            .method(Method::POST)
+            .uri("/v1/webhooks/strava/wrong-secret")
+            .body(Body::Text(body.to_string()))
+            .unwrap();
+        let response = route(req, ctx).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(repo.deleted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn allow_valid_path_revoke() {
+        let repo = Arc::new(MockRepository::with_connection(sample_connection()));
+        let ctx = test_ctx(Arc::clone(&repo), 120);
+        let body = serde_json::json!({
+            "object_type": "athlete",
+            "object_id": 42,
+            "aspect_type": "update",
+            "owner_id": 42,
+            "updates": {"authorized": "false"}
+        });
+        let req = http::Request::builder()
+            .method(Method::POST)
+            .uri("/v1/webhooks/strava/path-secret")
+            .body(Body::Text(body.to_string()))
+            .unwrap();
+        let response = route(req, ctx).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(repo.deleted.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn allow_valid_path_activity_event() {
+        let repo = Arc::new(MockRepository::with_connection(sample_connection()));
+        let ctx = test_ctx(Arc::clone(&repo), 120);
+        let body = serde_json::json!({
+            "object_type": "activity",
+            "object_id": 99,
+            "aspect_type": "create",
+            "owner_id": 42,
+            "updates": {}
+        });
+        let req = http::Request::builder()
+            .method(Method::POST)
+            .uri("/v1/webhooks/strava/path-secret")
+            .body(Body::Text(body.to_string()))
+            .unwrap();
+        let response = route(req, ctx).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(repo.events.lock().unwrap().len(), 1);
+        assert_eq!(repo.events.lock().unwrap()[0].external_workout_id, 99);
+        assert_eq!(repo.events.lock().unwrap()[0].aspect, "create");
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_event_flood_for_arbitrary_owner_is_blocked() {
+        let repo = Arc::new(MockRepository::with_connection(sample_connection()));
+        let ctx = test_ctx(Arc::clone(&repo), 120);
+        let body = serde_json::json!({
+            "object_type": "activity",
+            "object_id": 1,
+            "aspect_type": "create",
+            "owner_id": 42,
+            "updates": {}
+        });
+        for _ in 0..5 {
+            let req = http::Request::builder()
+                .method(Method::POST)
+                .uri("/v1/webhooks/strava/attacker")
+                .body(Body::Text(body.to_string()))
+                .unwrap();
+            let response = route(req, Arc::clone(&ctx)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+        assert!(repo.events.lock().unwrap().is_empty());
+        assert_eq!(*repo.lookups.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn authenticated_event_flood_is_rate_limited() {
+        let repo = Arc::new(MockRepository::with_connection(sample_connection()));
+        let ctx = test_ctx(Arc::clone(&repo), 2);
+        let body = serde_json::json!({
+            "object_type": "activity",
+            "object_id": 1,
+            "aspect_type": "create",
+            "owner_id": 42,
+            "updates": {}
+        });
+        for expected in [
+            StatusCode::OK,
+            StatusCode::OK,
+            StatusCode::TOO_MANY_REQUESTS,
+        ] {
+            let req = http::Request::builder()
+                .method(Method::POST)
+                .uri("/v1/webhooks/strava/path-secret")
+                .body(Body::Text(body.to_string()))
+                .unwrap();
+            let response = route(req, Arc::clone(&ctx)).await.unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        assert_eq!(repo.events.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn verify_challenge_works_with_secret_path_and_token() {
+        let repo = Arc::new(MockRepository::default());
+        let ctx = test_ctx(repo, 120);
+        let req = http::Request::builder()
+            .method(Method::GET)
+            .uri(
+                "/v1/webhooks/strava/path-secret?hub.mode=subscribe&hub.verify_token=verify&hub.challenge=abc123",
+            )
+            .body(Body::Empty)
+            .unwrap();
+        let response = route(req, ctx).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let Body::Text(body) = response.body() else {
+            panic!("expected JSON body");
+        };
+        assert!(body.contains("abc123"));
+    }
+
+    #[tokio::test]
+    async fn verify_challenge_rejects_wrong_path_secret() {
+        let repo = Arc::new(MockRepository::default());
+        let ctx = test_ctx(repo, 120);
+        let req = http::Request::builder()
+            .method(Method::GET)
+            .uri(
+                "/v1/webhooks/strava/wrong?hub.mode=subscribe&hub.verify_token=verify&hub.challenge=abc123",
+            )
+            .body(Body::Empty)
+            .unwrap();
+        let response = route(req, ctx).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    fn test_ctx(repo: Arc<MockRepository>, rate_limit: u64) -> Arc<Ctx> {
+        let config = Config {
+            strava_client_id: "clid".into(),
+            strava_client_secret: "csec".into(),
+            webhook_verify_token: "verify".into(),
+            webhook_path_secret: "path-secret".into(),
+            table_name: "lepre".into(),
+            token_encryption_key: [7u8; 32],
+            key_version: 1,
+            sync_gate: SyncGateConfig {
+                read_limit_15_minutes: 100,
+                read_limit_daily: 1_000,
+                safety_percent: 90,
+                queue_lease_seconds: 30,
+                poll_seconds: 2,
+            },
+            webhook_rate_limit_per_minute: rate_limit,
+        };
+        let application = Application::new(repo, Arc::new(MockProvider), config.sync_gate.clone());
+        Arc::new(Ctx {
+            config,
+            application,
+            webhook_rate_limit: WebhookRateLimit::new(rate_limit),
+        })
+    }
+
+    fn sample_connection() -> StoredProviderConnection {
+        StoredProviderConnection {
+            user_id: UserId::new("user-1").unwrap(),
+            first_name: "Ada".into(),
+            last_name: "Lovelace".into(),
+            connection: ProviderConnection {
+                id: ConnectionId::new("conn-1").unwrap(),
+                provider: ProviderId::Strava,
+                external_account_id: ExternalAccountId::new("42").unwrap(),
+            },
+            credentials: ProviderCredentials {
+                access_token: "access".into(),
+                refresh_token: "refresh".into(),
+                expires_at: 9_999_999_999,
+            },
+            token_version: 1,
+        }
+    }
+
+    #[derive(Default)]
+    struct MockRepository {
+        connection: Mutex<Option<StoredProviderConnection>>,
+        deleted: Mutex<Vec<UserId>>,
+        events: Mutex<Vec<ProviderEvent>>,
+        lookups: Mutex<u64>,
+    }
+
+    impl MockRepository {
+        fn with_connection(connection: StoredProviderConnection) -> Self {
+            Self {
+                connection: Mutex::new(Some(connection)),
+                deleted: Mutex::new(Vec::new()),
+                events: Mutex::new(Vec::new()),
+                lookups: Mutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Repository for MockRepository {
+        async fn connection_for_external(
+            &self,
+            _provider: ProviderId,
+            external_account_id: &ExternalAccountId,
+        ) -> Result<Option<StoredProviderConnection>, anyhow::Error> {
+            *self.lookups.lock().unwrap() += 1;
+            Ok(self
+                .connection
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|connection| {
+                    connection.connection.external_account_id == *external_account_id
+                })
+                .cloned())
+        }
+
+        async fn connection_for_user(
+            &self,
+            user_id: &UserId,
+        ) -> Result<Option<StoredProviderConnection>, anyhow::Error> {
+            Ok(self
+                .connection
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|connection| connection.user_id == *user_id)
+                .cloned())
+        }
+
+        async fn save_connection(
+            &self,
+            connection: &StoredProviderConnection,
+        ) -> Result<(), anyhow::Error> {
+            *self.connection.lock().unwrap() = Some(connection.clone());
+            Ok(())
+        }
+
+        async fn replace_credentials(
+            &self,
+            connection: &StoredProviderConnection,
+            _expected_version: i64,
+        ) -> Result<bool, anyhow::Error> {
+            *self.connection.lock().unwrap() = Some(connection.clone());
+            Ok(true)
+        }
+
+        async fn delete_connection(&self, user_id: &UserId) -> Result<(), anyhow::Error> {
+            self.deleted.lock().unwrap().push(user_id.clone());
+            *self.connection.lock().unwrap() = None;
+            Ok(())
+        }
+
+        async fn create_session(
+            &self,
+            _raw_session: &str,
+            _user_id: &UserId,
+            _expires_at: i64,
+        ) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
+
+        async fn user_for_session(
+            &self,
+            _raw_session: &str,
+            _now_seconds: i64,
+        ) -> Result<Option<UserId>, anyhow::Error> {
+            Ok(None)
+        }
+
+        async fn delete_session(&self, _raw_session: &str) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
+
+        async fn put_event(
+            &self,
+            _user_id: &UserId,
+            event: &ProviderEvent,
+            _received_at_millis: i64,
+        ) -> Result<(), anyhow::Error> {
+            self.events.lock().unwrap().push(event.clone());
+            Ok(())
+        }
+
+        async fn events(
+            &self,
+            _user_id: &UserId,
+            _after_millis: i64,
+            _through_millis: i64,
+        ) -> Result<Vec<ProviderEvent>, anyhow::Error> {
+            Ok(Vec::new())
+        }
+
+        async fn acquire_sync_turn(
+            &self,
+            _user_id: &UserId,
+            _now_millis: i64,
+            _config: &SyncGateConfig,
+        ) -> Result<SyncTurn, anyhow::Error> {
+            Ok(SyncTurn::Granted)
+        }
+    }
+
+    struct MockProvider;
+
+    #[async_trait]
+    impl Provider for MockProvider {
+        fn authorization_url(&self, _state: &str) -> String {
+            "https://example.test/oauth".into()
+        }
+
+        fn scopes_sufficient(&self, _scopes: &str) -> bool {
+            true
+        }
+
+        async fn authorize(
+            &self,
+            _code: &str,
+        ) -> Result<crate::application::AuthorizedProviderAccount, anyhow::Error> {
+            unimplemented!("authorize unused in webhook tests")
+        }
+
+        async fn refresh(
+            &self,
+            _refresh_token: &str,
+        ) -> Result<ProviderCredentials, anyhow::Error> {
+            unimplemented!("refresh unused in webhook tests")
+        }
+
+        async fn workouts(
+            &self,
+            _access_token: &str,
+            _after: i64,
+            _before: i64,
+            _page: i64,
+        ) -> Result<ProviderWorkoutPage, anyhow::Error> {
+            unimplemented!("workouts unused in webhook tests")
+        }
+
+        async fn workout(
+            &self,
+            _access_token: &str,
+            _external_workout_id: i64,
+        ) -> Result<Option<Workout>, anyhow::Error> {
+            unimplemented!("workout unused in webhook tests")
+        }
+
+        async fn deauthorize(&self, _access_token: &str) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
     }
 }
