@@ -22,12 +22,12 @@ async fn main() -> Result<(), Error> {
 
     let config = config::Config::load_from_ssm().await?;
     let aws = aws_config::load_from_env().await;
-    let store = db::Store::new(
+    let store = Arc::new(db::Store::new(
         aws_sdk_dynamodb::Client::new(&aws),
         config.table_name.clone(),
         config.token_encryption_key,
         config.key_version,
-    );
+    ));
     let http_client = strava::http_client()?;
     let provider = strava::StravaProvider::new(
         http_client,
@@ -35,7 +35,8 @@ async fn main() -> Result<(), Error> {
         config.strava_client_secret.clone(),
     );
     let application = Application::new(
-        Arc::new(store),
+        store.clone(),
+        store,
         Arc::new(provider),
         config.sync_gate.clone(),
     );

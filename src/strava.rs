@@ -10,12 +10,13 @@ use reqwest::header::RETRY_AFTER;
 use serde::{Deserialize, Serialize};
 
 use crate::application::{
-    AuthorizedProviderAccount, Provider, ProviderCredentials, ProviderRateLimited,
-    ProviderWorkoutPage,
+    AuthorizedProviderAccount, Provider, ProviderCredentials, ProviderHistoryPage,
+    ProviderRateLimited, ProviderWorkoutPage,
 };
 use crate::domain::{
     DomainError, ExternalAccountId, Lap, RunSport, Workout, WorkoutData, WorkoutId, WorkoutType,
 };
+use crate::history::utc_seconds;
 
 const AUTHORIZE_URL: &str = "https://www.strava.com/oauth/authorize";
 const TOKEN_URL: &str = "https://www.strava.com/oauth/token";
@@ -147,6 +148,8 @@ struct AthleteDto {
 struct SummaryActivityDto {
     id: i64,
     sport_type: String,
+    #[serde(default)]
+    start_date: String,
 }
 
 #[derive(Deserialize)]
@@ -406,19 +409,51 @@ impl Provider for StravaProvider {
         )
         .await?;
         let has_more = activities.len() == ACTIVITY_PAGE_SIZE as usize;
-        let ids = activities
-            .into_iter()
-            .filter(|activity| run_sport(&activity.sport_type).is_some())
-            .map(|activity| activity.id);
-        let workouts = stream::iter(ids)
-            .map(|id| async move { self.detailed_workout(access_token, id).await })
-            .buffered(DETAIL_CONCURRENCY)
-            .try_collect::<Vec<Option<Workout>>>()
-            .await?
-            .into_iter()
-            .flatten()
-            .collect();
+        let workouts = self.detailed_runs(access_token, activities).await?;
         Ok(ProviderWorkoutPage { workouts, has_more })
+    }
+
+    async fn history_page(
+        &self,
+        access_token: &str,
+        before_seconds: i64,
+    ) -> Result<ProviderHistoryPage, anyhow::Error> {
+        let started = Instant::now();
+        // Without `after`, Strava lists the newest activities first.
+        let activities: Vec<SummaryActivityDto> = checked_json(
+            self.client
+                .get(&self.endpoints.activities)
+                .bearer_auth(access_token)
+                .query(&[("before", before_seconds), ("per_page", ACTIVITY_PAGE_SIZE)])
+                .send()
+                .await?,
+            "list_activities",
+            started,
+        )
+        .await?;
+        let starts: Vec<i64> = activities
+            .iter()
+            .filter_map(|activity| {
+                let start = utc_seconds(&activity.start_date);
+                if start.is_none() {
+                    tracing::warn!(
+                        event = "strava_activity_without_start",
+                        activity_id = activity.id,
+                        "listed Strava activity has no usable start_date"
+                    );
+                }
+                start
+            })
+            .collect();
+        if starts.is_empty() && !activities.is_empty() {
+            anyhow::bail!("no listed Strava activity has a usable start_date");
+        }
+        let oldest_start_seconds = starts.into_iter().min();
+        let workouts = self.detailed_runs(access_token, activities).await?;
+        Ok(ProviderHistoryPage {
+            workouts,
+            oldest_start_seconds,
+        })
     }
 
     async fn workout(
@@ -447,6 +482,26 @@ impl Provider for StravaProvider {
 }
 
 impl StravaProvider {
+    /// Fetch details for the running activities of a list page.
+    async fn detailed_runs(
+        &self,
+        access_token: &str,
+        activities: Vec<SummaryActivityDto>,
+    ) -> Result<Vec<Workout>, anyhow::Error> {
+        let ids = activities
+            .into_iter()
+            .filter(|activity| run_sport(&activity.sport_type).is_some())
+            .map(|activity| activity.id);
+        Ok(stream::iter(ids)
+            .map(|id| async move { self.detailed_workout(access_token, id).await })
+            .buffered(DETAIL_CONCURRENCY)
+            .try_collect::<Vec<Option<Workout>>>()
+            .await?
+            .into_iter()
+            .flatten()
+            .collect())
+    }
+
     async fn detailed_workout(
         &self,
         access_token: &str,
@@ -837,6 +892,62 @@ mod tests {
             .await
             .unwrap();
         assert!(page.workouts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn history_page_lists_newest_first_before_the_cursor() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/activities"))
+            .and(query_param("before", "1800000000"))
+            .and(query_param("per_page", "10"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id":7, "sport_type":"Run", "start_date":"2026-07-15T06:00:00Z"},
+                {"id":8, "sport_type":"Ride", "start_date":"2026-07-14T06:00:00Z"}
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/activity/7"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id":7, "name":"Morning Run", "sport_type":"Run",
+                "start_date":"2026-07-15T06:00:00Z", "moving_time":3600,
+                "elapsed_time":3700, "distance":10050.5
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let page = StravaProvider::with_base_url(&server.uri())
+            .history_page("token", 1_800_000_000)
+            .await
+            .unwrap();
+
+        assert_eq!(page.workouts.len(), 1);
+        assert_eq!(page.workouts[0].id.as_str(), "strava:7");
+        // The cursor moves past the ride too, not only past runs.
+        assert_eq!(page.oldest_start_seconds, Some(1_784_008_800));
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests[0].url.query_pairs().all(|(key, _)| key != "after"));
+    }
+
+    #[tokio::test]
+    async fn empty_history_page_ends_the_walk() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/activities"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+
+        let page = StravaProvider::with_base_url(&server.uri())
+            .history_page("token", 1_800_000_000)
+            .await
+            .unwrap();
+
+        assert!(page.workouts.is_empty());
+        assert_eq!(page.oldest_start_seconds, None);
     }
 
     #[tokio::test]

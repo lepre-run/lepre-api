@@ -20,7 +20,8 @@ use crate::config::Config;
 use crate::cookie::{
     clear_session_cookie, mint_state, read_session_cookie, read_state_cookie, set_state_cookie,
 };
-use crate::domain::{ExternalAccountId, User, Workout};
+use crate::domain::{ExternalAccountId, User};
+use crate::history::WorkoutPayload;
 use crate::{headers, redirect};
 
 const APP_ORIGIN: &str = "https://lepre.run";
@@ -496,67 +497,6 @@ impl<'a> From<&'a User> for UserResponse<'a> {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct WorkoutResponse {
-    id: String,
-    performed_at: String,
-    name: String,
-    description: String,
-    #[serde(rename = "type")]
-    workout_type: &'static str,
-    sport: &'static str,
-    duration_seconds: i64,
-    elapsed_duration_seconds: i64,
-    distance_meters: f64,
-    average_heart_rate_bpm: Option<f64>,
-    max_heart_rate_bpm: Option<f64>,
-    laps: Vec<LapResponse>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct LapResponse {
-    index: i64,
-    name: String,
-    moving_duration_seconds: i64,
-    elapsed_duration_seconds: i64,
-    distance_meters: f64,
-    average_heart_rate_bpm: Option<f64>,
-    max_heart_rate_bpm: Option<f64>,
-}
-
-impl From<Workout> for WorkoutResponse {
-    fn from(workout: Workout) -> Self {
-        Self {
-            id: workout.id.to_string(),
-            performed_at: workout.performed_at,
-            name: workout.name,
-            description: workout.description,
-            workout_type: workout.workout_type.as_str(),
-            sport: workout.sport.as_str(),
-            duration_seconds: workout.duration_seconds,
-            elapsed_duration_seconds: workout.elapsed_duration_seconds,
-            distance_meters: workout.distance_meters,
-            average_heart_rate_bpm: workout.average_heart_rate_bpm,
-            max_heart_rate_bpm: workout.max_heart_rate_bpm,
-            laps: workout
-                .laps
-                .into_iter()
-                .map(|lap| LapResponse {
-                    index: lap.index,
-                    name: lap.name,
-                    moving_duration_seconds: lap.moving_duration_seconds,
-                    elapsed_duration_seconds: lap.elapsed_duration_seconds,
-                    distance_meters: lap.distance_meters,
-                    average_heart_rate_bpm: lap.average_heart_rate_bpm,
-                    max_heart_rate_bpm: lap.max_heart_rate_bpm,
-                })
-                .collect(),
-        }
-    }
-}
-
-#[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 enum ContinuationResponse {
     More { token: String },
@@ -565,7 +505,7 @@ enum ContinuationResponse {
 
 #[derive(Serialize)]
 struct SyncResponse {
-    upserted: Vec<WorkoutResponse>,
+    upserted: Vec<WorkoutPayload>,
     removed: Vec<String>,
     continuation: ContinuationResponse,
 }
@@ -735,7 +675,8 @@ mod tests {
     use async_trait::async_trait;
 
     use crate::application::{
-        Provider, ProviderCredentials, ProviderEvent, ProviderWorkoutPage, Repository,
+        HistoryRepository, ImportState, PendingImport, Provider, ProviderCredentials,
+        ProviderEvent, ProviderHistoryPage, ProviderWorkoutPage, Repository,
         StoredProviderConnection, SyncBatch, SyncGateConfig, SyncTurn,
     };
     use crate::domain::{
@@ -1094,7 +1035,12 @@ mod tests {
             },
             webhook_rate_limit_per_minute: rate_limit,
         };
-        let application = Application::new(repo, Arc::new(MockProvider), config.sync_gate.clone());
+        let application = Application::new(
+            repo,
+            Arc::new(MockHistory::default()),
+            Arc::new(MockProvider),
+            config.sync_gate.clone(),
+        );
         Arc::new(Ctx {
             config,
             application,
@@ -1289,8 +1235,74 @@ mod tests {
             unimplemented!("workout unused in webhook tests")
         }
 
+        async fn history_page(
+            &self,
+            _access_token: &str,
+            _before_seconds: i64,
+        ) -> Result<ProviderHistoryPage, anyhow::Error> {
+            unimplemented!("history_page unused in webhook tests")
+        }
+
         async fn deauthorize(&self, _access_token: &str) -> Result<(), anyhow::Error> {
             Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct MockHistory {
+        pending: Mutex<Vec<UserId>>,
+    }
+
+    #[async_trait]
+    impl HistoryRepository for MockHistory {
+        async fn mark_pending(
+            &self,
+            user_id: &UserId,
+            _now_millis: i64,
+        ) -> Result<(), anyhow::Error> {
+            self.pending.lock().unwrap().push(user_id.clone());
+            Ok(())
+        }
+
+        async fn pending_imports(&self) -> Result<Vec<PendingImport>, anyhow::Error> {
+            unimplemented!("pending_imports unused in webhook tests")
+        }
+
+        async fn record_turn(
+            &self,
+            _user_id: &UserId,
+            _now_millis: i64,
+            _retry_at_millis: i64,
+        ) -> Result<(), anyhow::Error> {
+            unimplemented!("record_turn unused in webhook tests")
+        }
+
+        async fn clear_pending(&self, _pending: &PendingImport) -> Result<(), anyhow::Error> {
+            unimplemented!("clear_pending unused in webhook tests")
+        }
+
+        async fn import_state(
+            &self,
+            _user_id: &UserId,
+        ) -> Result<Option<ImportState>, anyhow::Error> {
+            unimplemented!("import_state unused in webhook tests")
+        }
+
+        async fn save_import_state(
+            &self,
+            _user_id: &UserId,
+            _state: &ImportState,
+        ) -> Result<(), anyhow::Error> {
+            unimplemented!("save_import_state unused in webhook tests")
+        }
+
+        async fn apply_workout_changes(
+            &self,
+            _user_id: &UserId,
+            _upserts: Vec<Workout>,
+            _removals: Vec<WorkoutId>,
+        ) -> Result<(), anyhow::Error> {
+            unimplemented!("apply_workout_changes unused in webhook tests")
         }
     }
 }

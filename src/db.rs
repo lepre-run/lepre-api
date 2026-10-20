@@ -1,23 +1,29 @@
 //! DynamoDB adapter for application persistence ports.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use anyhow::{Context, anyhow};
 use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::{
-    AttributeValue, Delete as TransactDelete, Put as TransactPut, TransactWriteItem,
-    Update as TransactUpdate,
+    AttributeValue, Delete as TransactDelete, KeysAndAttributes, Put as TransactPut,
+    TransactWriteItem, Update as TransactUpdate,
 };
 use sha2::{Digest, Sha256};
 
 use crate::application::{
-    ProviderCredentials, ProviderEvent, Repository, SYNC_BATCH_REQUEST_COST,
-    StoredProviderConnection, SyncGateConfig, SyncTurn,
+    HistoryRepository, ImportState, ImportStatus, PendingImport, ProviderCredentials,
+    ProviderEvent, Repository, SYNC_BATCH_REQUEST_COST, StoredProviderConnection, SyncGateConfig,
+    SyncTurn,
 };
 use crate::crypto::{EncryptedToken, TokenKind, decrypt, encrypt};
-use crate::domain::{ConnectionId, ExternalAccountId, ProviderConnection, ProviderId, UserId};
+use crate::domain::{
+    ConnectionId, ExternalAccountId, ProviderConnection, ProviderId, UserId, Workout, WorkoutId,
+};
+use crate::history::{
+    ChangeSet, MonthState, StoredWorkoutState, WorkoutRecord, affected_months, plan_changes,
+};
 
 const PK: &str = "pk";
 const SK: &str = "sk";
@@ -26,6 +32,13 @@ const SESSION_SK: &str = "SESSION";
 const SYNC_QUEUE_PK: &str = "SYNC_QUEUE";
 const SYNC_QUEUE_MARKER_SK: &str = "SYNC_QUEUE";
 const STRAVA_QUOTA_PK: &str = "STRAVA_QUOTA";
+const HISTORY_PENDING_PK: &str = "HISTORY_PENDING";
+const HISTORY_IMPORT_SK: &str = "HISTORY_IMPORT";
+const WORKOUT_SK_PREFIX: &str = "WORKOUT#";
+const MONTH_SK_PREFIX: &str = "MONTH#";
+const MAX_BATCH_GET_KEYS: usize = 100;
+const MAX_TRANSACTION_ITEMS: usize = 100;
+const MAX_CHANGE_ATTEMPTS: usize = 3;
 
 struct QueueMarker {
     queue_sk: String,
@@ -756,6 +769,7 @@ impl Repository for Store {
                 events.push(ProviderEvent {
                     external_workout_id: n(item, "external_workout_id")?,
                     aspect: s(item, "aspect")?.to_owned(),
+                    received_at_millis: event_received_at(s(item, SK)?)?,
                 });
             }
             // Query stops at 1MB per page; keep reading until DynamoDB returns no continuation key.
@@ -803,6 +817,474 @@ impl Repository for Store {
             retry_after_seconds: config.poll_seconds,
         })
     }
+}
+
+#[async_trait]
+impl HistoryRepository for Store {
+    async fn mark_pending(&self, user_id: &UserId, now_millis: i64) -> Result<(), anyhow::Error> {
+        self.client
+            .update_item()
+            .table_name(&self.table)
+            .key(PK, AttributeValue::S(HISTORY_PENDING_PK.to_owned()))
+            .key(SK, AttributeValue::S(user_pk(user_id)))
+            .update_expression(
+                "SET user_id = :user_id, touched_at_millis = :now, \
+                 last_turn_millis = if_not_exists(last_turn_millis, :zero), \
+                 retry_at_millis = if_not_exists(retry_at_millis, :zero)",
+            )
+            .expression_attribute_values(":user_id", AttributeValue::S(user_id.to_string()))
+            .expression_attribute_values(":now", AttributeValue::N(now_millis.to_string()))
+            .expression_attribute_values(":zero", AttributeValue::N("0".to_owned()))
+            .send()
+            .await
+            .context("dynamodb mark history import pending failed")?;
+        Ok(())
+    }
+
+    async fn pending_imports(&self) -> Result<Vec<PendingImport>, anyhow::Error> {
+        let mut pending = Vec::new();
+        let mut exclusive_start_key = None;
+        loop {
+            let response = self
+                .client
+                .query()
+                .table_name(&self.table)
+                .key_condition_expression("pk = :pk")
+                .expression_attribute_values(
+                    ":pk",
+                    AttributeValue::S(HISTORY_PENDING_PK.to_owned()),
+                )
+                .consistent_read(true)
+                .set_exclusive_start_key(exclusive_start_key)
+                .send()
+                .await
+                .context("dynamodb query pending history imports failed")?;
+            for item in response.items() {
+                pending.push(PendingImport {
+                    user_id: UserId::new(s(item, "user_id")?)?,
+                    touched_at_millis: n(item, "touched_at_millis")?,
+                    last_turn_millis: n(item, "last_turn_millis")?,
+                    retry_at_millis: n(item, "retry_at_millis")?,
+                });
+            }
+            match response.last_evaluated_key {
+                Some(key) if !key.is_empty() => exclusive_start_key = Some(key),
+                _ => return Ok(pending),
+            }
+        }
+    }
+
+    async fn record_turn(
+        &self,
+        user_id: &UserId,
+        now_millis: i64,
+        retry_at_millis: i64,
+    ) -> Result<(), anyhow::Error> {
+        let result = self
+            .client
+            .update_item()
+            .table_name(&self.table)
+            .key(PK, AttributeValue::S(HISTORY_PENDING_PK.to_owned()))
+            .key(SK, AttributeValue::S(user_pk(user_id)))
+            .update_expression("SET last_turn_millis = :now, retry_at_millis = :retry")
+            .condition_expression("attribute_exists(pk)")
+            .expression_attribute_values(":now", AttributeValue::N(now_millis.to_string()))
+            .expression_attribute_values(":retry", AttributeValue::N(retry_at_millis.to_string()))
+            .send()
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(|value| value.is_conditional_check_failed_exception()) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error).context("dynamodb record history import turn failed"),
+        }
+    }
+
+    async fn clear_pending(&self, pending: &PendingImport) -> Result<(), anyhow::Error> {
+        let result = self
+            .client
+            .delete_item()
+            .table_name(&self.table)
+            .key(PK, AttributeValue::S(HISTORY_PENDING_PK.to_owned()))
+            .key(SK, AttributeValue::S(user_pk(&pending.user_id)))
+            .condition_expression("touched_at_millis = :seen")
+            .expression_attribute_values(
+                ":seen",
+                AttributeValue::N(pending.touched_at_millis.to_string()),
+            )
+            .send()
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(|value| value.is_conditional_check_failed_exception()) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error).context("dynamodb clear pending history import failed"),
+        }
+    }
+
+    async fn import_state(&self, user_id: &UserId) -> Result<Option<ImportState>, anyhow::Error> {
+        let response = self
+            .client
+            .get_item()
+            .table_name(&self.table)
+            .key(PK, AttributeValue::S(user_pk(user_id)))
+            .key(SK, AttributeValue::S(HISTORY_IMPORT_SK.to_owned()))
+            .consistent_read(true)
+            .send()
+            .await
+            .context("dynamodb get history import state failed")?;
+        response
+            .item
+            .as_ref()
+            .map(|item| {
+                Ok(ImportState {
+                    status: match s(item, "import_status")? {
+                        "in_progress" => ImportStatus::InProgress,
+                        "complete" => ImportStatus::Complete,
+                        other => return Err(anyhow!("unknown history import status {other}")),
+                    },
+                    before_seconds: n(item, "before_seconds")?,
+                    event_cursor_millis: n(item, "event_cursor_millis")?,
+                    imported_count: n(item, "imported_count")?,
+                    started_at_millis: n(item, "started_at_millis")?,
+                })
+            })
+            .transpose()
+    }
+
+    async fn save_import_state(
+        &self,
+        user_id: &UserId,
+        state: &ImportState,
+    ) -> Result<(), anyhow::Error> {
+        let status = match state.status {
+            ImportStatus::InProgress => "in_progress",
+            ImportStatus::Complete => "complete",
+        };
+        self.client
+            .put_item()
+            .table_name(&self.table)
+            .item(PK, AttributeValue::S(user_pk(user_id)))
+            .item(SK, AttributeValue::S(HISTORY_IMPORT_SK.to_owned()))
+            .item("import_status", AttributeValue::S(status.to_owned()))
+            .item(
+                "before_seconds",
+                AttributeValue::N(state.before_seconds.to_string()),
+            )
+            .item(
+                "event_cursor_millis",
+                AttributeValue::N(state.event_cursor_millis.to_string()),
+            )
+            .item(
+                "imported_count",
+                AttributeValue::N(state.imported_count.to_string()),
+            )
+            .item(
+                "started_at_millis",
+                AttributeValue::N(state.started_at_millis.to_string()),
+            )
+            .send()
+            .await
+            .context("dynamodb save history import state failed")?;
+        Ok(())
+    }
+
+    async fn apply_workout_changes(
+        &self,
+        user_id: &UserId,
+        upserts: Vec<Workout>,
+        removals: Vec<WorkoutId>,
+    ) -> Result<(), anyhow::Error> {
+        let records: Vec<WorkoutRecord> = upserts
+            .into_iter()
+            .filter_map(|workout| {
+                let id = workout.id.to_string();
+                let record = WorkoutRecord::new(workout);
+                if record.is_none() {
+                    tracing::warn!(
+                        event = "history_workout_skipped",
+                        workout_id = id,
+                        "workout start time has no month bucket"
+                    );
+                }
+                record
+            })
+            .collect();
+        let removals: Vec<String> = removals.iter().map(ToString::to_string).collect();
+        if records.is_empty() && removals.is_empty() {
+            return Ok(());
+        }
+        let ids: BTreeSet<String> = records
+            .iter()
+            .map(|record| record.id.clone())
+            .chain(removals.iter().cloned())
+            .collect();
+        for _ in 0..MAX_CHANGE_ATTEMPTS {
+            let existing = self.stored_workouts(user_id, &ids).await?;
+            let months = self
+                .stored_months(user_id, &affected_months(&existing, &records))
+                .await?;
+            let changes = plan_changes(&existing, &months, records.clone(), &removals, || {
+                uuid::Uuid::new_v4().to_string()
+            });
+            if changes.is_empty() || self.commit_changes(user_id, &changes).await? {
+                return Ok(());
+            }
+        }
+        Err(anyhow!(
+            "history changes kept conflicting with concurrent writes"
+        ))
+    }
+}
+
+impl Store {
+    async fn batch_get(
+        &self,
+        keys: Vec<HashMap<String, AttributeValue>>,
+    ) -> Result<Vec<HashMap<String, AttributeValue>>, anyhow::Error> {
+        let mut items = Vec::new();
+        for chunk in keys.chunks(MAX_BATCH_GET_KEYS) {
+            let mut request = Some(
+                KeysAndAttributes::builder()
+                    .set_keys(Some(chunk.to_vec()))
+                    .consistent_read(true)
+                    .build()?,
+            );
+            while let Some(keys) = request.take() {
+                let response = self
+                    .client
+                    .batch_get_item()
+                    .request_items(&self.table, keys)
+                    .send()
+                    .await
+                    .context("dynamodb batch get history items failed")?;
+                if let Some(found) = response
+                    .responses
+                    .and_then(|mut tables| tables.remove(&self.table))
+                {
+                    items.extend(found);
+                }
+                request = response
+                    .unprocessed_keys
+                    .and_then(|mut tables| tables.remove(&self.table))
+                    .filter(|keys| !keys.keys().is_empty());
+            }
+        }
+        Ok(items)
+    }
+
+    async fn stored_workouts(
+        &self,
+        user_id: &UserId,
+        ids: &BTreeSet<String>,
+    ) -> Result<HashMap<String, StoredWorkoutState>, anyhow::Error> {
+        let keys = ids
+            .iter()
+            .map(|id| history_key(user_id, format!("{WORKOUT_SK_PREFIX}{id}")))
+            .collect();
+        self.batch_get(keys)
+            .await?
+            .iter()
+            .map(|item| {
+                let id = s(item, SK)?
+                    .strip_prefix(WORKOUT_SK_PREFIX)
+                    .ok_or_else(|| anyhow!("workout item has an unexpected sort key"))?;
+                Ok((
+                    id.to_owned(),
+                    StoredWorkoutState {
+                        month: s(item, "month")?.to_owned(),
+                        sync_version: s(item, "sync_version")?.to_owned(),
+                        fingerprint: s(item, "fingerprint")?.to_owned(),
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    async fn stored_months(
+        &self,
+        user_id: &UserId,
+        months: &BTreeSet<String>,
+    ) -> Result<HashMap<String, MonthState>, anyhow::Error> {
+        let keys = months
+            .iter()
+            .map(|month| history_key(user_id, format!("{MONTH_SK_PREFIX}{month}")))
+            .collect();
+        self.batch_get(keys)
+            .await?
+            .iter()
+            .map(|item| {
+                let members = item
+                    .get("members")
+                    .and_then(|value| value.as_m().ok())
+                    .ok_or_else(|| anyhow!("month item has no members"))?
+                    .iter()
+                    .map(|(id, version)| {
+                        version
+                            .as_s()
+                            .map(|version| (id.clone(), version.clone()))
+                            .map_err(|_| anyhow!("month member version is not a string"))
+                    })
+                    .collect::<Result<_, anyhow::Error>>()?;
+                Ok((
+                    s(item, "month")?.to_owned(),
+                    MonthState {
+                        members,
+                        rev: n(item, "rev")?,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// Write a change set atomically. `Ok(false)` means a concurrent writer
+    /// changed an affected month first and the caller should re-plan.
+    async fn commit_changes(
+        &self,
+        user_id: &UserId,
+        changes: &ChangeSet,
+    ) -> Result<bool, anyhow::Error> {
+        let mut items = Vec::new();
+        for write in &changes.workout_writes {
+            let put = TransactPut::builder()
+                .table_name(&self.table)
+                .set_item(Some(HashMap::from([
+                    (PK.to_owned(), AttributeValue::S(user_pk(user_id))),
+                    (
+                        SK.to_owned(),
+                        AttributeValue::S(format!("{WORKOUT_SK_PREFIX}{}", write.record.id)),
+                    ),
+                    (
+                        "month".to_owned(),
+                        AttributeValue::S(write.record.month.clone()),
+                    ),
+                    (
+                        "sync_version".to_owned(),
+                        AttributeValue::S(write.sync_version.clone()),
+                    ),
+                    (
+                        "fingerprint".to_owned(),
+                        AttributeValue::S(write.record.fingerprint.clone()),
+                    ),
+                    (
+                        "payload".to_owned(),
+                        AttributeValue::S(write.record.payload.clone()),
+                    ),
+                ])))
+                .build()?;
+            items.push(TransactWriteItem::builder().put(put).build());
+        }
+        for id in &changes.workout_deletes {
+            let delete = TransactDelete::builder()
+                .table_name(&self.table)
+                .set_key(Some(history_key(
+                    user_id,
+                    format!("{WORKOUT_SK_PREFIX}{id}"),
+                )))
+                .build()?;
+            items.push(TransactWriteItem::builder().delete(delete).build());
+        }
+        for month in &changes.month_writes {
+            let key = history_key(user_id, format!("{MONTH_SK_PREFIX}{}", month.month));
+            match (month.expected_rev, month.members.is_empty()) {
+                (None, true) => {}
+                (Some(rev), true) => {
+                    let delete = TransactDelete::builder()
+                        .table_name(&self.table)
+                        .set_key(Some(key))
+                        .condition_expression("#rev = :rev")
+                        .expression_attribute_names("#rev", "rev")
+                        .expression_attribute_values(":rev", AttributeValue::N(rev.to_string()))
+                        .build()?;
+                    items.push(TransactWriteItem::builder().delete(delete).build());
+                }
+                (expected_rev, false) => {
+                    let mut item = key;
+                    item.insert("month".to_owned(), AttributeValue::S(month.month.clone()));
+                    item.insert(
+                        "members".to_owned(),
+                        AttributeValue::M(
+                            month
+                                .members
+                                .iter()
+                                .map(|(id, version)| {
+                                    (id.clone(), AttributeValue::S(version.clone()))
+                                })
+                                .collect(),
+                        ),
+                    );
+                    item.insert("digest".to_owned(), AttributeValue::S(month.digest()));
+                    item.insert(
+                        "workout_count".to_owned(),
+                        AttributeValue::N(month.members.len().to_string()),
+                    );
+                    item.insert(
+                        "rev".to_owned(),
+                        AttributeValue::N((expected_rev.unwrap_or(0) + 1).to_string()),
+                    );
+                    let put = TransactPut::builder()
+                        .table_name(&self.table)
+                        .set_item(Some(item))
+                        .expression_attribute_names("#rev", "rev");
+                    let put = match expected_rev {
+                        Some(rev) => put
+                            .condition_expression("#rev = :rev")
+                            .expression_attribute_values(
+                                ":rev",
+                                AttributeValue::N(rev.to_string()),
+                            ),
+                        None => put.condition_expression("attribute_not_exists(#rev)"),
+                    };
+                    items.push(TransactWriteItem::builder().put(put.build()?).build());
+                }
+            }
+        }
+        if items.len() > MAX_TRANSACTION_ITEMS {
+            anyhow::bail!("history change set exceeds one DynamoDB transaction");
+        }
+        let result = self
+            .client
+            .transact_write_items()
+            .set_transact_items(Some(items))
+            .send()
+            .await;
+        match result {
+            Ok(_) => Ok(true),
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(|value| value.is_transaction_canceled_exception()) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error).context("dynamodb commit history changes failed"),
+        }
+    }
+}
+
+fn history_key(user_id: &UserId, sk: String) -> HashMap<String, AttributeValue> {
+    HashMap::from([
+        (PK.to_owned(), AttributeValue::S(user_pk(user_id))),
+        (SK.to_owned(), AttributeValue::S(sk)),
+    ])
+}
+
+/// Receive time encoded in an `EVENT#{millis:020}#{uuid}` sort key.
+fn event_received_at(sk: &str) -> Result<i64, anyhow::Error> {
+    sk.strip_prefix("EVENT#")
+        .and_then(|rest| rest.get(..20))
+        .and_then(|millis| millis.parse().ok())
+        .ok_or_else(|| anyhow!("event item has an unexpected sort key"))
 }
 
 fn user_pk(user_id: &UserId) -> String {
@@ -864,6 +1346,9 @@ fn n(item: &HashMap<String, AttributeValue>, key: &str) -> Result<i64, anyhow::E
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_sdk_dynamodb::config::{BehaviorVersion, Credentials, Region};
+    use wiremock::matchers::{body_string_contains, header, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn keys_are_provider_independent() {
@@ -889,10 +1374,6 @@ mod tests {
 
     #[tokio::test]
     async fn events_follow_pagination_past_the_first_page() {
-        use aws_sdk_dynamodb::config::{BehaviorVersion, Credentials, Region};
-        use wiremock::matchers::{body_string_contains, method};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
         let server = MockServer::start().await;
         let last_key = r#"{"pk":{"S":"USER#user-1"},"sk":{"S":"EVENT#00000000000000000002#b"}}"#;
         let page = |items: &str, last: Option<&str>| {
@@ -907,7 +1388,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(body_string_contains("ExclusiveStartKey"))
             .respond_with(page(
-                r#"{"external_workout_id":{"N":"3"},"aspect":{"S":"delete"}}"#,
+                r#"{"sk":{"S":"EVENT#00000000000000000007#c"},"external_workout_id":{"N":"3"},"aspect":{"S":"delete"}}"#,
                 None,
             ))
             .expect(1)
@@ -917,7 +1398,7 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .respond_with(page(
-                r#"{"external_workout_id":{"N":"1"},"aspect":{"S":"create"}},{"external_workout_id":{"N":"2"},"aspect":{"S":"update"}}"#,
+                r#"{"sk":{"S":"EVENT#00000000000000000001#a"},"external_workout_id":{"N":"1"},"aspect":{"S":"create"}},{"sk":{"S":"EVENT#00000000000000000002#b"},"external_workout_id":{"N":"2"},"aspect":{"S":"update"}}"#,
                 Some(last_key),
             ))
             .expect(1)
@@ -925,13 +1406,7 @@ mod tests {
             .with_priority(2)
             .mount(&server)
             .await;
-        let config = aws_sdk_dynamodb::Config::builder()
-            .behavior_version(BehaviorVersion::latest())
-            .region(Region::new("eu-west-1"))
-            .credentials_provider(Credentials::for_tests())
-            .endpoint_url(server.uri())
-            .build();
-        let store = Store::new(Client::from_conf(config), "table".into(), [0; 32], 1);
+        let store = test_store(&server);
 
         let events = store
             .events(&UserId::new("user-1").unwrap(), 0, 10)
@@ -940,8 +1415,148 @@ mod tests {
 
         let ids: Vec<_> = events
             .iter()
-            .map(|event| (event.external_workout_id, event.aspect.as_str()))
+            .map(|event| {
+                (
+                    event.external_workout_id,
+                    event.aspect.as_str(),
+                    event.received_at_millis,
+                )
+            })
             .collect();
-        assert_eq!(ids, [(1, "create"), (2, "update"), (3, "delete")]);
+        assert_eq!(ids, [(1, "create", 1), (2, "update", 2), (3, "delete", 7)]);
+    }
+
+    fn test_store(server: &MockServer) -> Store {
+        let config = aws_sdk_dynamodb::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("eu-west-1"))
+            .credentials_provider(Credentials::for_tests())
+            .endpoint_url(server.uri())
+            .build();
+        Store::new(Client::from_conf(config), "table".into(), [0; 32], 1)
+    }
+
+    fn dynamodb_json(status: u16, body: &str) -> ResponseTemplate {
+        ResponseTemplate::new(status)
+            .insert_header("content-type", "application/x-amz-json-1.0")
+            .set_body_string(body.to_owned())
+    }
+
+    fn operation(name: &str) -> wiremock::matchers::HeaderExactMatcher {
+        header("x-amz-target", format!("DynamoDB_20120810.{name}").as_str())
+    }
+
+    fn easy_run() -> Workout {
+        use crate::domain::{RunSport, WorkoutData, WorkoutType};
+        Workout::new(WorkoutData {
+            id: WorkoutId::new("strava:1").unwrap(),
+            performed_at: "2026-10-10T08:00:00Z".to_owned(),
+            name: "Easy".to_owned(),
+            description: String::new(),
+            workout_type: WorkoutType::Workout,
+            sport: RunSport::Run,
+            duration_seconds: 1_800,
+            elapsed_duration_seconds: 1_800,
+            distance_meters: 5_000.0,
+            average_heart_rate_bpm: None,
+            max_heart_rate_bpm: None,
+            laps: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn new_workout_is_written_with_its_month_in_one_transaction() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(operation("BatchGetItem"))
+            .respond_with(dynamodb_json(200, r#"{"Responses":{"table":[]}}"#))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(operation("TransactWriteItems"))
+            .respond_with(dynamodb_json(200, "{}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        test_store(&server)
+            .apply_workout_changes(
+                &UserId::new("user-1").unwrap(),
+                vec![easy_run()],
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let transaction = String::from_utf8(requests[2].body.clone()).unwrap();
+        assert!(transaction.contains(r#""S":"WORKOUT#strava:1""#));
+        assert!(transaction.contains(r#""S":"MONTH#2026-10""#));
+        assert!(transaction.contains("attribute_not_exists(#rev)"));
+        assert!(transaction.contains(r#""rev":{"N":"1"}"#));
+    }
+
+    #[tokio::test]
+    async fn conflicting_month_write_is_replanned() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(operation("BatchGetItem"))
+            .respond_with(dynamodb_json(200, r#"{"Responses":{"table":[]}}"#))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(operation("TransactWriteItems"))
+            .respond_with(dynamodb_json(
+                400,
+                r#"{"__type":"com.amazonaws.dynamodb.v20120810#TransactionCanceledException","message":"Transaction cancelled","CancellationReasons":[{"Code":"ConditionalCheckFailed"}]}"#,
+            ))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(operation("TransactWriteItems"))
+            .respond_with(dynamodb_json(200, "{}"))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        test_store(&server)
+            .apply_workout_changes(
+                &UserId::new("user-1").unwrap(),
+                vec![easy_run()],
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn clearing_pending_keeps_an_entry_touched_after_it_was_read() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(operation("DeleteItem"))
+            .and(body_string_contains("touched_at_millis = :seen"))
+            .respond_with(dynamodb_json(
+                400,
+                r#"{"__type":"com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException","message":"The conditional request failed"}"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        test_store(&server)
+            .clear_pending(&PendingImport {
+                user_id: UserId::new("user-1").unwrap(),
+                touched_at_millis: 5,
+                last_turn_millis: 0,
+                retry_at_millis: 0,
+            })
+            .await
+            .unwrap();
     }
 }
