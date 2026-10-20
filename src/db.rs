@@ -730,34 +730,40 @@ impl Repository for Store {
         after_millis: i64,
         through_millis: i64,
     ) -> Result<Vec<ProviderEvent>, anyhow::Error> {
-        let response = self
-            .client
-            .query()
-            .table_name(&self.table)
-            .key_condition_expression("pk = :pk AND sk BETWEEN :after AND :through")
-            .expression_attribute_values(":pk", AttributeValue::S(user_pk(user_id)))
-            .expression_attribute_values(
-                ":after",
-                AttributeValue::S(format!("EVENT#{after_millis:020}")),
-            )
-            .expression_attribute_values(
-                ":through",
-                AttributeValue::S(format!("EVENT#{through_millis:020}~")),
-            )
-            .consistent_read(true)
-            .send()
-            .await
-            .context("dynamodb query provider events failed")?;
-        response
-            .items()
-            .iter()
-            .map(|item| {
-                Ok(ProviderEvent {
+        let mut events = Vec::new();
+        let mut exclusive_start_key = None;
+        loop {
+            let response = self
+                .client
+                .query()
+                .table_name(&self.table)
+                .key_condition_expression("pk = :pk AND sk BETWEEN :after AND :through")
+                .expression_attribute_values(":pk", AttributeValue::S(user_pk(user_id)))
+                .expression_attribute_values(
+                    ":after",
+                    AttributeValue::S(format!("EVENT#{after_millis:020}")),
+                )
+                .expression_attribute_values(
+                    ":through",
+                    AttributeValue::S(format!("EVENT#{through_millis:020}~")),
+                )
+                .consistent_read(true)
+                .set_exclusive_start_key(exclusive_start_key)
+                .send()
+                .await
+                .context("dynamodb query provider events failed")?;
+            for item in response.items() {
+                events.push(ProviderEvent {
                     external_workout_id: n(item, "external_workout_id")?,
                     aspect: s(item, "aspect")?.to_owned(),
-                })
-            })
-            .collect()
+                });
+            }
+            // Query stops at 1MB per page; keep reading until DynamoDB returns no continuation key.
+            match response.last_evaluated_key {
+                Some(key) if !key.is_empty() => exclusive_start_key = Some(key),
+                _ => return Ok(events),
+            }
+        }
     }
 
     async fn acquire_sync_turn(
@@ -879,5 +885,63 @@ mod tests {
     fn optional_strings_allow_legacy_connection_records() {
         let item = HashMap::new();
         assert_eq!(optional_s(&item, "first_name"), None);
+    }
+
+    #[tokio::test]
+    async fn events_follow_pagination_past_the_first_page() {
+        use aws_sdk_dynamodb::config::{BehaviorVersion, Credentials, Region};
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let last_key = r#"{"pk":{"S":"USER#user-1"},"sk":{"S":"EVENT#00000000000000000002#b"}}"#;
+        let page = |items: &str, last: Option<&str>| {
+            let body = match last {
+                Some(key) => format!(r#"{{"Items":[{items}],"LastEvaluatedKey":{key}}}"#),
+                None => format!(r#"{{"Items":[{items}]}}"#),
+            };
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/x-amz-json-1.0")
+                .set_body_string(body)
+        };
+        Mock::given(method("POST"))
+            .and(body_string_contains("ExclusiveStartKey"))
+            .respond_with(page(
+                r#"{"external_workout_id":{"N":"3"},"aspect":{"S":"delete"}}"#,
+                None,
+            ))
+            .expect(1)
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(page(
+                r#"{"external_workout_id":{"N":"1"},"aspect":{"S":"create"}},{"external_workout_id":{"N":"2"},"aspect":{"S":"update"}}"#,
+                Some(last_key),
+            ))
+            .expect(1)
+            .up_to_n_times(1)
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        let config = aws_sdk_dynamodb::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("eu-west-1"))
+            .credentials_provider(Credentials::for_tests())
+            .endpoint_url(server.uri())
+            .build();
+        let store = Store::new(Client::from_conf(config), "table".into(), [0; 32], 1);
+
+        let events = store
+            .events(&UserId::new("user-1").unwrap(), 0, 10)
+            .await
+            .unwrap();
+
+        let ids: Vec<_> = events
+            .iter()
+            .map(|event| (event.external_workout_id, event.aspect.as_str()))
+            .collect();
+        assert_eq!(ids, [(1, "create"), (2, "update"), (3, "delete")]);
     }
 }
