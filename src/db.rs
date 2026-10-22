@@ -404,6 +404,28 @@ impl Store {
             .map_or(Ok(0), |item| n(item, "reserved"))
     }
 
+    async fn charge_quota(
+        &self,
+        quota_sk: &str,
+        reads: i64,
+        expires_at: i64,
+    ) -> Result<(), anyhow::Error> {
+        self.client
+            .update_item()
+            .table_name(&self.table)
+            .key(PK, AttributeValue::S(STRAVA_QUOTA_PK.to_owned()))
+            .key(SK, AttributeValue::S(quota_sk.to_owned()))
+            .update_expression(
+                "SET expires_at = if_not_exists(expires_at, :expires) ADD reserved :reads",
+            )
+            .expression_attribute_values(":reads", AttributeValue::N(reads.to_string()))
+            .expression_attribute_values(":expires", AttributeValue::N(expires_at.to_string()))
+            .send()
+            .await
+            .context("dynamodb charge Strava reads failed")?;
+        Ok(())
+    }
+
     async fn reserve_sync_turn(
         &self,
         marker: &QueueMarker,
@@ -816,6 +838,33 @@ impl Repository for Store {
         Ok(SyncTurn::Queued {
             retry_after_seconds: config.poll_seconds,
         })
+    }
+
+    async fn charge_reads(&self, now_millis: i64, reads: i64) -> Result<(), anyhow::Error> {
+        if reads <= 0 {
+            return Ok(());
+        }
+        let now_seconds = now_millis / 1_000;
+        let window_start = now_seconds.div_euclid(15 * 60) * 15 * 60;
+        let day_start = now_seconds.div_euclid(24 * 60 * 60) * 24 * 60 * 60;
+        self.charge_quota(
+            &format!("READ#15M#{window_start:020}"),
+            reads,
+            window_start + 2 * 24 * 60 * 60,
+        )
+        .await?;
+        self.charge_quota(
+            &format!("READ#DAY#{day_start:020}"),
+            reads,
+            day_start + 3 * 24 * 60 * 60,
+        )
+        .await?;
+        tracing::info!(
+            event = "strava_reads_charged",
+            reads,
+            "charged Strava reads beyond a granted turn"
+        );
+        Ok(())
     }
 }
 

@@ -28,6 +28,10 @@ const MAX_FAILED_TURN_BACKOFF_MILLIS: i64 = 6 * 60 * 60 * 1_000;
 /// read on a later turn.
 const EVENT_VISIBILITY_GRACE_MILLIS: i64 = 10_000;
 pub const SYNC_BATCH_REQUEST_COST: i64 = 21;
+/// Strava reads of one history page: the list plus up to 10 details.
+const HISTORY_PAGE_REQUEST_COST: i64 = 11;
+/// Strava reads of one activity detail.
+const WORKOUT_REQUEST_COST: i64 = 1;
 
 #[derive(Debug, Clone)]
 pub struct ProviderCredentials {
@@ -275,6 +279,10 @@ pub trait Repository: Send + Sync {
         now_millis: i64,
         config: &SyncGateConfig,
     ) -> Result<SyncTurn, anyhow::Error>;
+    /// Book `reads` extra Strava reads against the shared quota windows,
+    /// without a limit check: they are spent beyond a granted turn's
+    /// reservation, e.g. when a request is retried after a token refresh.
+    async fn charge_reads(&self, now_millis: i64, reads: i64) -> Result<(), anyhow::Error>;
 }
 
 #[async_trait]
@@ -916,8 +924,14 @@ impl Application {
                 {
                     Ok(fetched) => break fetched,
                     Err(error) => {
-                        self.recover_unauthorized(user_id, &mut token, error)
-                            .await?
+                        self.recover_unauthorized(
+                            user_id,
+                            &mut token,
+                            error,
+                            WORKOUT_REQUEST_COST,
+                            now_millis,
+                        )
+                        .await?
                     }
                 }
             };
@@ -948,8 +962,14 @@ impl Application {
                 {
                     Ok(page) => break page,
                     Err(error) => {
-                        self.recover_unauthorized(user_id, &mut token, error)
-                            .await?
+                        self.recover_unauthorized(
+                            user_id,
+                            &mut token,
+                            error,
+                            HISTORY_PAGE_REQUEST_COST,
+                            now_millis,
+                        )
+                        .await?
                     }
                 }
             };
@@ -1025,6 +1045,8 @@ impl Application {
         user_id: &UserId,
         token: &mut TurnToken,
         error: anyhow::Error,
+        retry_cost: i64,
+        now_millis: i64,
     ) -> Result<(), ApplicationError> {
         if token.refreshed || error.downcast_ref::<ProviderAuthRevoked>().is_none() {
             return Err(provider_error(error));
@@ -1037,6 +1059,11 @@ impl Application {
         token.access_token = self
             .forced_access_token(user_id, &token.access_token)
             .await?;
+        // The retry is not covered by the turn's reservation.
+        self.repository
+            .charge_reads(now_millis, retry_cost)
+            .await
+            .map_err(ApplicationError::Persistence)?;
         Ok(())
     }
 
@@ -1300,6 +1327,7 @@ mod tests {
         events: Mutex<Vec<ProviderEvent>>,
         grants_left: Mutex<usize>,
         turn_requests: Mutex<Vec<UserId>>,
+        charged_reads: Mutex<i64>,
     }
 
     impl FakeRepository {
@@ -1309,6 +1337,7 @@ mod tests {
                 events: Mutex::new(Vec::new()),
                 grants_left: Mutex::new(grants),
                 turn_requests: Mutex::new(Vec::new()),
+                charged_reads: Mutex::new(0),
             }
         }
     }
@@ -1434,6 +1463,11 @@ mod tests {
             }
             *grants_left -= 1;
             Ok(SyncTurn::Granted)
+        }
+
+        async fn charge_reads(&self, _now_millis: i64, reads: i64) -> Result<(), anyhow::Error> {
+            *self.charged_reads.lock().unwrap() += reads;
+            Ok(())
         }
     }
 
@@ -2208,6 +2242,11 @@ mod tests {
         // each: the retry rides on the first turn's reservation.
         assert_eq!(report.turns, 2);
         assert_eq!(repository.turn_requests.lock().unwrap().len(), 2);
+        // The retried page is charged on top of the reservation.
+        assert_eq!(
+            *repository.charged_reads.lock().unwrap(),
+            HISTORY_PAGE_REQUEST_COST
+        );
         let state = history.state("u1").unwrap();
         assert_eq!(state.status, ImportStatus::Complete);
         assert_eq!(state.imported_count, 1);
@@ -2215,6 +2254,48 @@ mod tests {
         assert_eq!(stored.credentials.access_token, "fresh");
         assert_eq!(stored.credentials.refresh_token, "refresh-2");
         assert_eq!(stored.token_version, 2);
+    }
+
+    #[tokio::test]
+    async fn rejected_detail_call_is_refreshed_retried_and_charged() {
+        let repository = Arc::new(FakeRepository::new(vec![connection("u1", "42")], 10));
+        let history = Arc::new(FakeHistory::with_pending(&[("u1", 0)]));
+        history.states.lock().unwrap().insert(
+            "u1".into(),
+            ImportState {
+                status: ImportStatus::Complete,
+                before_seconds: 0,
+                event_cursor_millis: 1_000,
+                imported_count: 0,
+                started_at_millis: 1_000,
+                boundary_ids: Vec::new(),
+                rev: 0,
+            },
+        );
+        repository
+            .events
+            .lock()
+            .unwrap()
+            .push(event(5, "create", 2_000));
+        let provider = Arc::new(FakeProvider {
+            rejected_tokens: vec!["access"],
+            details: HashMap::from([(5, workout(5, "2026-10-05T06:00:00Z"))]),
+            ..FakeProvider::default()
+        });
+
+        let report = application(&repository, &history, &provider)
+            .import_tick(NOW_MILLIS, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(report.failed, 0);
+        assert_eq!(history.stored_ids(), ["strava:5"]);
+        assert_eq!(*provider.used_tokens.lock().unwrap(), ["access", "fresh"]);
+        assert_eq!(
+            *repository.charged_reads.lock().unwrap(),
+            WORKOUT_REQUEST_COST
+        );
+        assert!(!history.is_pending("u1"));
     }
 
     #[tokio::test]
