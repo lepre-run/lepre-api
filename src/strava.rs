@@ -425,6 +425,7 @@ impl Provider for StravaProvider {
         &self,
         access_token: &str,
         before_seconds: i64,
+        skip_ids: &[i64],
     ) -> Result<ProviderHistoryPage, anyhow::Error> {
         let started = Instant::now();
         // Without `after`, Strava lists the newest activities first.
@@ -439,7 +440,7 @@ impl Provider for StravaProvider {
             started,
         )
         .await?;
-        let starts: Vec<i64> = activities
+        let starts: Vec<(i64, i64)> = activities
             .iter()
             .filter_map(|activity| {
                 let start = utc_seconds(&activity.start_date);
@@ -450,17 +451,33 @@ impl Provider for StravaProvider {
                         "listed Strava activity has no usable start_date"
                     );
                 }
-                start
+                start.map(|start| (activity.id, start))
             })
             .collect();
         if starts.is_empty() && !activities.is_empty() {
             anyhow::bail!("no listed Strava activity has a usable start_date");
         }
-        let oldest_start_seconds = starts.into_iter().min();
-        let workouts = self.detailed_runs(access_token, activities).await?;
+        let oldest_start_seconds = starts.iter().map(|(_, start)| *start).min();
+        let oldest_ids = starts
+            .iter()
+            .filter(|(_, start)| Some(*start) == oldest_start_seconds)
+            .map(|(id, _)| *id)
+            .collect();
+        let full = activities.len() == ACTIVITY_PAGE_SIZE as usize;
+        // Activities already imported from the re-listed boundary second
+        // cost no detail request.
+        let fresh: Vec<SummaryActivityDto> = activities
+            .into_iter()
+            .filter(|activity| !skip_ids.contains(&activity.id))
+            .collect();
+        let new_activities = fresh.len();
+        let workouts = self.detailed_runs(access_token, fresh).await?;
         Ok(ProviderHistoryPage {
             workouts,
             oldest_start_seconds,
+            oldest_ids,
+            new_activities,
+            full,
         })
     }
 
@@ -949,7 +966,7 @@ mod tests {
             .await;
 
         let page = StravaProvider::with_base_url(&server.uri())
-            .history_page("token", 1_800_000_000)
+            .history_page("token", 1_800_000_000, &[])
             .await
             .unwrap();
 
@@ -971,7 +988,7 @@ mod tests {
             .await;
 
         let page = StravaProvider::with_base_url(&server.uri())
-            .history_page("token", 1_800_000_000)
+            .history_page("token", 1_800_000_000, &[])
             .await
             .unwrap();
 
@@ -992,7 +1009,7 @@ mod tests {
             .await;
 
         let error = StravaProvider::with_base_url(&server.uri())
-            .history_page("token", 1_800_000_000)
+            .history_page("token", 1_800_000_000, &[])
             .await
             .unwrap_err();
 
@@ -1051,6 +1068,83 @@ mod tests {
 
             assert!(error.downcast_ref::<ProviderAuthRevoked>().is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn history_page_skips_details_for_already_imported_boundary_activities() {
+        let server = MockServer::start().await;
+        // Re-listing the boundary second (before = tie + 1) returns run 10
+        // again, next to its same-second sibling 11 and an older run 12.
+        Mock::given(method("GET"))
+            .and(path("/activities"))
+            .and(query_param("before", "1784008801"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id":10, "sport_type":"Run", "start_date":"2026-07-14T06:00:00Z"},
+                {"id":11, "sport_type":"Run", "start_date":"2026-07-14T06:00:00Z"},
+                {"id":12, "sport_type":"Run", "start_date":"2026-07-13T06:00:00Z"}
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/activity/10"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        for (id, start) in [(11, "2026-07-14T06:00:00Z"), (12, "2026-07-13T06:00:00Z")] {
+            Mock::given(method("GET"))
+                .and(path(format!("/activity/{id}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id":id, "name":"Run", "sport_type":"Run", "start_date":start,
+                    "moving_time":1800, "elapsed_time":1800, "distance":5000.0
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let page = StravaProvider::with_base_url(&server.uri())
+            .history_page("token", 1_784_008_801, &[10])
+            .await
+            .unwrap();
+
+        let ids: Vec<_> = page.workouts.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["strava:11", "strava:12"]);
+        assert_eq!(page.new_activities, 2);
+        assert!(!page.full);
+        assert_eq!(page.oldest_start_seconds, Some(1_783_922_400));
+        assert_eq!(page.oldest_ids, [12]);
+    }
+
+    #[tokio::test]
+    async fn history_page_reports_every_activity_at_the_oldest_second() {
+        let server = MockServer::start().await;
+        let listed: Vec<_> = (1..=10)
+            .map(|id| {
+                let start = if id >= 9 {
+                    "2026-07-14T06:00:00Z"
+                } else {
+                    "2026-07-15T06:00:00Z"
+                };
+                serde_json::json!({"id":id, "sport_type":"Ride", "start_date":start})
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/activities"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(listed))
+            .mount(&server)
+            .await;
+
+        let page = StravaProvider::with_base_url(&server.uri())
+            .history_page("token", 1_800_000_000, &[])
+            .await
+            .unwrap();
+
+        assert!(page.full);
+        assert_eq!(page.new_activities, 10);
+        assert_eq!(page.oldest_start_seconds, Some(1_784_008_800));
+        assert_eq!(page.oldest_ids, [9, 10]);
     }
 
     #[tokio::test]

@@ -63,10 +63,18 @@ pub struct ProviderWorkoutPage {
 /// One page of history, newest first, listed strictly before a cursor.
 #[derive(Debug)]
 pub struct ProviderHistoryPage {
+    /// Detailed runs among the listed activities that were not skipped.
     pub workouts: Vec<Workout>,
-    /// Start time of the oldest listed activity of any sport; `None` when the
-    /// page is empty and the history walk is done.
+    /// Start time of the oldest listed activity of any sport, skipped ones
+    /// included; `None` when the page is empty and the history walk is done.
     pub oldest_start_seconds: Option<i64>,
+    /// Every listed activity (any sport, skipped or not) that started exactly
+    /// at `oldest_start_seconds`.
+    pub oldest_ids: Vec<i64>,
+    /// Listed activities that were not in the skip list.
+    pub new_activities: usize,
+    /// Whether the listing returned a full page.
+    pub full: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +104,11 @@ pub struct ImportState {
     pub event_cursor_millis: i64,
     pub imported_count: i64,
     pub started_at_millis: i64,
+    /// Activities starting exactly at `before_seconds` that are already
+    /// imported. The next page re-lists that second (`before_seconds + 1`)
+    /// and skips these, so same-second activities split across a page
+    /// boundary are not lost.
+    pub boundary_ids: Vec<i64>,
 }
 
 impl ImportState {
@@ -106,6 +119,7 @@ impl ImportState {
             event_cursor_millis: now_millis - EVENT_VISIBILITY_GRACE_MILLIS,
             imported_count: 0,
             started_at_millis: now_millis,
+            boundary_ids: Vec::new(),
         }
     }
 }
@@ -276,10 +290,13 @@ pub trait Provider: Send + Sync {
         access_token: &str,
         external_workout_id: i64,
     ) -> Result<Option<Workout>, anyhow::Error>;
+    /// List activities that started strictly before `before_seconds`, newest
+    /// first, without fetching details for `skip_ids`.
     async fn history_page(
         &self,
         access_token: &str,
         before_seconds: i64,
+        skip_ids: &[i64],
     ) -> Result<ProviderHistoryPage, anyhow::Error>;
     async fn deauthorize(&self, access_token: &str) -> Result<(), anyhow::Error>;
 }
@@ -358,6 +375,8 @@ enum TurnOutcome {
     WaitForEvents {
         retry_at_millis: i64,
     },
+    /// The history walk stalled; the import is marked `Failed`.
+    Failed,
 }
 
 impl Application {
@@ -715,6 +734,13 @@ impl Application {
                         entry.failures = 0;
                         next_round.push(entry);
                     }
+                    Ok(TurnOutcome::Failed) => {
+                        report.failed += 1;
+                        self.history
+                            .clear_pending(&entry)
+                            .await
+                            .map_err(ApplicationError::Persistence)?;
+                    }
                     Ok(TurnOutcome::WaitForEvents { retry_at_millis }) => self
                         .history
                         .record_turn(&entry.user_id, now_millis, retry_at_millis, 0)
@@ -867,28 +893,44 @@ impl Application {
         if state.status != ImportStatus::Complete {
             // A failed import resumes once the user is marked pending again.
             state.status = ImportStatus::InProgress;
+            // Re-list the boundary second and skip what is already imported:
+            // Strava's `before` is strict and pages hold 10 activities.
             let page = self
                 .provider
-                .history_page(access_token, state.before_seconds)
+                .history_page(access_token, state.before_seconds + 1, &state.boundary_ids)
                 .await
                 .map_err(provider_error)?;
             match page.oldest_start_seconds {
-                Some(oldest) if oldest < state.before_seconds => {
+                None => state.status = ImportStatus::Complete,
+                Some(oldest) if page.new_activities == 0 || oldest > state.before_seconds => {
+                    if page.full || oldest > state.before_seconds {
+                        tracing::warn!(
+                            event = "history_import_cursor_stalled",
+                            before_seconds = state.before_seconds,
+                            "history page brought no new activities; marking the import failed"
+                        );
+                        state.status = ImportStatus::Failed;
+                    } else {
+                        // Only the already imported boundary second is left.
+                        state.status = ImportStatus::Complete;
+                    }
+                }
+                Some(oldest) => {
                     state.imported_count += page.workouts.len() as i64;
                     self.history
                         .apply_workout_changes(user_id, page.workouts, Vec::new())
                         .await
                         .map_err(ApplicationError::Persistence)?;
+                    if oldest < state.before_seconds {
+                        state.boundary_ids.clear();
+                    }
+                    for id in page.oldest_ids {
+                        if !state.boundary_ids.contains(&id) {
+                            state.boundary_ids.push(id);
+                        }
+                    }
                     state.before_seconds = oldest;
                 }
-                Some(_) => {
-                    tracing::warn!(
-                        event = "history_import_cursor_stalled",
-                        "history page did not move the cursor back; ending the import"
-                    );
-                    state.status = ImportStatus::Complete;
-                }
-                None => state.status = ImportStatus::Complete,
             }
         }
         self.history
@@ -896,6 +938,9 @@ impl Application {
             .await
             .map_err(ApplicationError::Persistence)?;
         let newest_recent = recent.iter().map(|event| event.received_at_millis).max();
+        if state.status == ImportStatus::Failed {
+            return Ok(TurnOutcome::Failed);
+        }
         Ok(
             match (
                 state.status == ImportStatus::Complete && !more_events,
@@ -1439,6 +1484,11 @@ mod tests {
         detail_requests: Mutex<Vec<i64>>,
         refresh_error: Mutex<Option<anyhow::Error>>,
         refresh_requests: Mutex<usize>,
+        /// When non-empty, `history_page` lists from this simulated Strava
+        /// account (`(id, start_date)` runs) instead of `pages`.
+        catalog: Vec<(i64, &'static str)>,
+        skip_lists: Mutex<Vec<Vec<i64>>>,
+        detailed_ids: Mutex<Vec<i64>>,
     }
 
     impl FakeProvider {
@@ -1447,6 +1497,53 @@ mod tests {
                 pages: Mutex::new(pages.into_iter().map(Ok).collect()),
                 ..Self::default()
             }
+        }
+
+        /// Strava's listing: strictly before the cursor, newest first, 10 per
+        /// page; ties in one second keep a stable order.
+        fn catalog_page(&self, before_seconds: i64, skip_ids: &[i64]) -> ProviderHistoryPage {
+            let mut listed: Vec<(i64, i64, &str)> = self
+                .catalog
+                .iter()
+                .map(|(id, start)| (*id, crate::history::utc_seconds(start).unwrap(), *start))
+                .filter(|(_, start, _)| *start < before_seconds)
+                .collect();
+            listed
+                .sort_by_key(|(id, start, _)| (std::cmp::Reverse(*start), std::cmp::Reverse(*id)));
+            listed.truncate(10);
+            let oldest = listed.iter().map(|(_, start, _)| *start).min();
+            let fresh: Vec<_> = listed
+                .iter()
+                .filter(|(id, _, _)| !skip_ids.contains(id))
+                .collect();
+            self.detailed_ids
+                .lock()
+                .unwrap()
+                .extend(fresh.iter().map(|(id, _, _)| *id));
+            ProviderHistoryPage {
+                workouts: fresh
+                    .iter()
+                    .map(|(id, _, start)| workout(*id, start))
+                    .collect(),
+                oldest_start_seconds: oldest,
+                oldest_ids: listed
+                    .iter()
+                    .filter(|(_, start, _)| Some(*start) == oldest)
+                    .map(|(id, _, _)| *id)
+                    .collect(),
+                new_activities: fresh.len(),
+                full: listed.len() == 10,
+            }
+        }
+    }
+
+    fn history_page(workouts: Vec<Workout>, oldest_start_seconds: i64) -> ProviderHistoryPage {
+        ProviderHistoryPage {
+            new_activities: workouts.len(),
+            workouts,
+            oldest_start_seconds: Some(oldest_start_seconds),
+            oldest_ids: Vec::new(),
+            full: false,
         }
     }
 
@@ -1501,12 +1598,20 @@ mod tests {
             &self,
             _access_token: &str,
             before_seconds: i64,
+            skip_ids: &[i64],
         ) -> Result<ProviderHistoryPage, anyhow::Error> {
             self.page_cursors.lock().unwrap().push(before_seconds);
+            self.skip_lists.lock().unwrap().push(skip_ids.to_vec());
+            if !self.catalog.is_empty() {
+                return Ok(self.catalog_page(before_seconds, skip_ids));
+            }
             self.pages.lock().unwrap().pop_front().unwrap_or_else(|| {
                 Ok(ProviderHistoryPage {
                     workouts: Vec::new(),
                     oldest_start_seconds: None,
+                    oldest_ids: Vec::new(),
+                    new_activities: 0,
+                    full: false,
                 })
             })
         }
@@ -1534,17 +1639,14 @@ mod tests {
         let repository = Arc::new(FakeRepository::new(vec![connection("u1", "42")], 10));
         let history = Arc::new(FakeHistory::with_pending(&[("u1", 0)]));
         let provider = Arc::new(FakeProvider::with_pages(vec![
-            ProviderHistoryPage {
-                workouts: vec![
+            history_page(
+                vec![
                     workout(3, "2026-10-02T06:00:00Z"),
                     workout(2, "2026-09-20T06:00:00Z"),
                 ],
-                oldest_start_seconds: Some(1_789_000_000),
-            },
-            ProviderHistoryPage {
-                workouts: vec![workout(1, "2025-01-05T06:00:00Z")],
-                oldest_start_seconds: Some(1_736_000_000),
-            },
+                1_789_000_000,
+            ),
+            history_page(vec![workout(1, "2025-01-05T06:00:00Z")], 1_736_000_000),
         ]));
 
         let report = application(&repository, &history, &provider)
@@ -1554,7 +1656,7 @@ mod tests {
 
         assert_eq!(
             *provider.page_cursors.lock().unwrap(),
-            [NOW_MILLIS / 1_000, 1_789_000_000, 1_736_000_000]
+            [NOW_MILLIS / 1_000 + 1, 1_789_000_001, 1_736_000_001]
         );
         assert_eq!(history.stored_ids(), ["strava:1", "strava:2", "strava:3"]);
         let state = history.state("u1").unwrap();
@@ -1588,6 +1690,7 @@ mod tests {
                 event_cursor_millis: 1_000,
                 imported_count: 2,
                 started_at_millis: 1_000,
+                boundary_ids: Vec::new(),
             },
         );
         repository.events.lock().unwrap().extend([
@@ -1706,6 +1809,85 @@ mod tests {
         assert_eq!(report.turns, 1);
     }
 
+    #[tokio::test]
+    async fn same_second_activities_split_across_pages_are_both_imported() {
+        let repository = Arc::new(FakeRepository::new(vec![connection("u1", "42")], 10));
+        let history = Arc::new(FakeHistory::with_pending(&[("u1", 0)]));
+        // Nine newer runs fill the first page with run 3; run 2 shares run
+        // 3's start second but lands on the next page.
+        let mut catalog: Vec<(i64, &'static str)> = vec![
+            (12, "2026-10-12T06:00:00Z"),
+            (11, "2026-10-11T06:00:00Z"),
+            (10, "2026-10-10T06:00:00Z"),
+            (9, "2026-10-09T06:00:00Z"),
+            (8, "2026-10-08T06:00:00Z"),
+            (7, "2026-10-07T06:00:00Z"),
+            (6, "2026-10-06T06:00:00Z"),
+            (5, "2026-10-05T06:00:00Z"),
+            (4, "2026-10-04T06:00:00Z"),
+        ];
+        catalog.extend([
+            (3, "2026-10-03T06:00:00Z"),
+            (2, "2026-10-03T06:00:00Z"),
+            (1, "2026-10-01T06:00:00Z"),
+        ]);
+        let provider = Arc::new(FakeProvider {
+            catalog,
+            ..FakeProvider::default()
+        });
+
+        let report = application(&repository, &history, &provider)
+            .import_tick(NOW_MILLIS, 10)
+            .await
+            .unwrap();
+
+        let tie = crate::history::utc_seconds("2026-10-03T06:00:00Z").unwrap();
+        let oldest = crate::history::utc_seconds("2026-10-01T06:00:00Z").unwrap();
+        assert_eq!(
+            *provider.page_cursors.lock().unwrap(),
+            [NOW_MILLIS / 1_000 + 1, tie + 1, oldest + 1]
+        );
+        assert_eq!(
+            *provider.skip_lists.lock().unwrap(),
+            [vec![], vec![3], vec![1]]
+        );
+        let mut stored = history.stored_ids();
+        stored.sort_by_key(|id| id[7..].parse::<i64>().unwrap());
+        let expected: Vec<String> = (1..=12).map(|id| format!("strava:{id}")).collect();
+        assert_eq!(stored, expected);
+        // Every activity is detailed exactly once despite the overlap.
+        let mut detailed = provider.detailed_ids.lock().unwrap().clone();
+        detailed.sort();
+        assert_eq!(detailed, (1..=12).collect::<Vec<_>>());
+        assert_eq!(history.state("u1").unwrap().status, ImportStatus::Complete);
+        assert_eq!(report.completed, 1);
+    }
+
+    #[tokio::test]
+    async fn walk_that_makes_no_progress_fails_instead_of_completing() {
+        let repository = Arc::new(FakeRepository::new(vec![connection("u1", "42")], 10));
+        let history = Arc::new(FakeHistory::with_pending(&[("u1", 0)]));
+        // Twelve activities in one second: the listing keeps returning the
+        // same ten, so the last two can never be reached.
+        let provider = Arc::new(FakeProvider {
+            catalog: (1..=12).map(|id| (id, "2026-10-03T06:00:00Z")).collect(),
+            ..FakeProvider::default()
+        });
+
+        let report = application(&repository, &history, &provider)
+            .import_tick(NOW_MILLIS, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(history.stored_ids().len(), 10);
+        let state = history.state("u1").unwrap();
+        assert_eq!(state.status, ImportStatus::Failed);
+        assert_eq!(state.boundary_ids.len(), 10);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.completed, 0);
+        assert!(!history.is_pending("u1"));
+    }
+
     #[test]
     fn failure_backoff_doubles_up_to_six_hours() {
         let minutes = |failures| failed_turn_backoff_millis(failures) / 60_000;
@@ -1763,10 +1945,10 @@ mod tests {
             .get_mut("u1")
             .unwrap()
             .failures = 4;
-        let provider = Arc::new(FakeProvider::with_pages(vec![ProviderHistoryPage {
-            workouts: vec![workout(1, "2026-10-01T06:00:00Z")],
-            oldest_start_seconds: Some(1_789_000_000),
-        }]));
+        let provider = Arc::new(FakeProvider::with_pages(vec![history_page(
+            vec![workout(1, "2026-10-01T06:00:00Z")],
+            1_789_000_000,
+        )]));
 
         application(&repository, &history, &provider)
             .import_tick(NOW_MILLIS, 1)
@@ -1868,6 +2050,7 @@ mod tests {
                 event_cursor_millis: 1_000,
                 imported_count: 4,
                 started_at_millis: 1_000,
+                boundary_ids: Vec::new(),
             },
         );
         history.mark_pending(&user("u1"), 2_000).await.unwrap();
@@ -1878,7 +2061,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(*provider.page_cursors.lock().unwrap(), [1_789_000_000]);
+        assert_eq!(*provider.page_cursors.lock().unwrap(), [1_789_000_001]);
         assert_eq!(history.state("u1").unwrap().status, ImportStatus::Complete);
     }
 
@@ -1945,6 +2128,7 @@ mod tests {
             event_cursor_millis,
             imported_count: 0,
             started_at_millis: 1_000,
+            boundary_ids: Vec::new(),
         }
     }
 

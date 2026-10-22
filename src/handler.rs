@@ -1239,6 +1239,7 @@ mod tests {
             &self,
             _access_token: &str,
             _before_seconds: i64,
+            _skip_ids: &[i64],
         ) -> Result<ProviderHistoryPage, anyhow::Error> {
             unimplemented!("history_page unused in webhook tests")
         }

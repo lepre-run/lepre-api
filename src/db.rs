@@ -973,6 +973,20 @@ impl HistoryRepository for Store {
                     event_cursor_millis: n(item, "event_cursor_millis")?,
                     imported_count: n(item, "imported_count")?,
                     started_at_millis: n(item, "started_at_millis")?,
+                    boundary_ids: match item.get("boundary_ids") {
+                        None => Vec::new(),
+                        Some(value) => value
+                            .as_l()
+                            .map_err(|_| anyhow!("boundary_ids is not a list"))?
+                            .iter()
+                            .map(|id| {
+                                id.as_n()
+                                    .map_err(|_| anyhow!("boundary id is not a number"))?
+                                    .parse()
+                                    .context("invalid boundary id")
+                            })
+                            .collect::<Result<_, anyhow::Error>>()?,
+                    },
                 })
             })
             .transpose()
@@ -1009,6 +1023,16 @@ impl HistoryRepository for Store {
             .item(
                 "started_at_millis",
                 AttributeValue::N(state.started_at_millis.to_string()),
+            )
+            .item(
+                "boundary_ids",
+                AttributeValue::L(
+                    state
+                        .boundary_ids
+                        .iter()
+                        .map(|id| AttributeValue::N(id.to_string()))
+                        .collect(),
+                ),
             )
             .send()
             .await
@@ -1585,6 +1609,42 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn import_state_round_trips_the_page_boundary_ids() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(operation("PutItem"))
+            .and(body_string_contains(
+                r#""boundary_ids":{"L":[{"N":"10"},{"N":"11"}]}"#,
+            ))
+            .respond_with(dynamodb_json(200, "{}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(operation("GetItem"))
+            .respond_with(dynamodb_json(
+                200,
+                r#"{"Item":{"import_status":{"S":"in_progress"},"before_seconds":{"N":"7"},"event_cursor_millis":{"N":"8"},"imported_count":{"N":"2"},"started_at_millis":{"N":"1"},"boundary_ids":{"L":[{"N":"10"},{"N":"11"}]}}}"#,
+            ))
+            .mount(&server)
+            .await;
+        let store = test_store(&server);
+        let user = UserId::new("user-1").unwrap();
+        let state = ImportState {
+            status: ImportStatus::InProgress,
+            before_seconds: 7,
+            event_cursor_millis: 8,
+            imported_count: 2,
+            started_at_millis: 1,
+            boundary_ids: vec![10, 11],
+        };
+
+        store.save_import_state(&user, &state).await.unwrap();
+
+        assert_eq!(store.import_state(&user).await.unwrap(), Some(state));
     }
 
     #[tokio::test]
