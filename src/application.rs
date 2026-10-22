@@ -21,6 +21,12 @@ const MAX_SYNC_EVENT_BATCH: usize = 10;
 /// consecutive failure, up to `MAX_FAILED_TURN_BACKOFF_MILLIS`.
 const FAILED_TURN_BACKOFF_MILLIS: i64 = 15 * 60 * 1_000;
 const MAX_FAILED_TURN_BACKOFF_MILLIS: i64 = 6 * 60 * 60 * 1_000;
+/// Webhook EVENT rows are stamped when the request arrives but written a
+/// little later, so concurrent webhooks can become visible out of order. The
+/// import only consumes events at least this old, and never moves its event
+/// cursor past `now - EVENT_VISIBILITY_GRACE_MILLIS`, so a late row is still
+/// read on a later turn.
+const EVENT_VISIBILITY_GRACE_MILLIS: i64 = 10_000;
 pub const SYNC_BATCH_REQUEST_COST: i64 = 21;
 
 #[derive(Debug, Clone)]
@@ -97,7 +103,7 @@ impl ImportState {
         Self {
             status: ImportStatus::InProgress,
             before_seconds: now_millis / 1_000,
-            event_cursor_millis: now_millis,
+            event_cursor_millis: now_millis - EVENT_VISIBILITY_GRACE_MILLIS,
             imported_count: 0,
             started_at_millis: now_millis,
         }
@@ -108,8 +114,11 @@ impl ImportState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingImport {
     pub user_id: UserId,
-    /// Last time something added work; clearing is conditional on it.
+    /// Last time something added work.
     pub touched_at_millis: i64,
+    /// Bumped by every `mark_pending`; clearing is conditional on it, so a
+    /// touch during a turn always keeps the entry.
+    pub touch_seq: i64,
     pub last_turn_millis: i64,
     /// No turn is taken for this user before this time.
     pub retry_at_millis: i64,
@@ -345,6 +354,10 @@ pub struct Application {
 enum TurnOutcome {
     Finished,
     MoreWork,
+    /// Nothing to do until recent events are old enough to read safely.
+    WaitForEvents {
+        retry_at_millis: i64,
+    },
 }
 
 impl Application {
@@ -702,6 +715,11 @@ impl Application {
                         entry.failures = 0;
                         next_round.push(entry);
                     }
+                    Ok(TurnOutcome::WaitForEvents { retry_at_millis }) => self
+                        .history
+                        .record_turn(&entry.user_id, now_millis, retry_at_millis, 0)
+                        .await
+                        .map_err(ApplicationError::Persistence)?,
                     Err(error) => {
                         if self
                             .turn_failed(&entry, error, now_millis, &mut report)
@@ -811,12 +829,15 @@ impl Application {
             .map_err(ApplicationError::Persistence)?
             .unwrap_or_else(|| ImportState::started(now_millis));
 
-        let events = self
+        let settled_through_millis = now_millis - EVENT_VISIBILITY_GRACE_MILLIS;
+        let (settled, recent): (Vec<_>, Vec<_>) = self
             .repository
             .events(user_id, state.event_cursor_millis, now_millis)
             .await
-            .map_err(ApplicationError::Persistence)?;
-        let (batch, more_events) = event_batch(events, MAX_SYNC_EVENT_BATCH);
+            .map_err(ApplicationError::Persistence)?
+            .into_iter()
+            .partition(|event| event.received_at_millis <= settled_through_millis);
+        let (batch, more_events) = event_batch(settled, MAX_SYNC_EVENT_BATCH);
         if let Some(last) = batch.last() {
             state.event_cursor_millis = last.received_at_millis + 1;
         }
@@ -874,11 +895,19 @@ impl Application {
             .save_import_state(user_id, &state)
             .await
             .map_err(ApplicationError::Persistence)?;
-        Ok(if state.status == ImportStatus::Complete && !more_events {
-            TurnOutcome::Finished
-        } else {
-            TurnOutcome::MoreWork
-        })
+        let newest_recent = recent.iter().map(|event| event.received_at_millis).max();
+        Ok(
+            match (
+                state.status == ImportStatus::Complete && !more_events,
+                newest_recent,
+            ) {
+                (false, _) => TurnOutcome::MoreWork,
+                (true, None) => TurnOutcome::Finished,
+                (true, Some(newest)) => TurnOutcome::WaitForEvents {
+                    retry_at_millis: newest + EVENT_VISIBILITY_GRACE_MILLIS,
+                },
+            },
+        )
     }
 
     async fn authenticate(
@@ -1222,6 +1251,9 @@ mod tests {
         workouts: Mutex<HashMap<String, StoredWorkoutState>>,
         months: Mutex<HashMap<String, MonthState>>,
         next_version: Mutex<u64>,
+        /// When set, every `save_import_state` also touches the pending entry
+        /// at this millisecond, like a webhook arriving during the turn.
+        touch_on_save_millis: Mutex<Option<i64>>,
     }
 
     impl FakeHistory {
@@ -1233,6 +1265,7 @@ mod tests {
                     PendingImport {
                         user_id: user(user_id),
                         touched_at_millis: 1,
+                        touch_seq: 1,
                         last_turn_millis: *last_turn_millis,
                         retry_at_millis: 0,
                         failures: 0,
@@ -1265,12 +1298,13 @@ mod tests {
             now_millis: i64,
         ) -> Result<(), anyhow::Error> {
             let mut pending = self.pending.lock().unwrap();
-            let (last_turn_millis, retry_at_millis, failures) =
-                pending.get(user_id.as_str()).map_or((0, 0, 0), |entry| {
+            let (last_turn_millis, retry_at_millis, failures, touch_seq) =
+                pending.get(user_id.as_str()).map_or((0, 0, 0, 0), |entry| {
                     (
                         entry.last_turn_millis,
                         entry.retry_at_millis,
                         entry.failures,
+                        entry.touch_seq,
                     )
                 });
             pending.insert(
@@ -1278,6 +1312,7 @@ mod tests {
                 PendingImport {
                     user_id: user_id.clone(),
                     touched_at_millis: now_millis,
+                    touch_seq: touch_seq + 1,
                     last_turn_millis,
                     retry_at_millis,
                     failures,
@@ -1309,7 +1344,7 @@ mod tests {
             let mut pending = self.pending.lock().unwrap();
             if pending
                 .get(seen.user_id.as_str())
-                .is_some_and(|entry| entry.touched_at_millis == seen.touched_at_millis)
+                .is_some_and(|entry| entry.touch_seq == seen.touch_seq)
             {
                 pending.remove(seen.user_id.as_str());
             }
@@ -1332,6 +1367,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(user_id.to_string(), state.clone());
+            let touch = *self.touch_on_save_millis.lock().unwrap();
+            if let Some(millis) = touch {
+                self.mark_pending(user_id, millis).await?;
+            }
             Ok(())
         }
 
@@ -1897,5 +1936,118 @@ mod tests {
             history.pending.lock().unwrap()["u1"].touched_at_millis,
             5_000
         );
+    }
+
+    fn completed_state(event_cursor_millis: i64) -> ImportState {
+        ImportState {
+            status: ImportStatus::Complete,
+            before_seconds: 0,
+            event_cursor_millis,
+            imported_count: 0,
+            started_at_millis: 1_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn event_that_becomes_visible_late_is_not_skipped() {
+        let repository = Arc::new(FakeRepository::new(vec![connection("u1", "42")], 10));
+        let history = Arc::new(FakeHistory::with_pending(&[("u1", 0)]));
+        history
+            .states
+            .lock()
+            .unwrap()
+            .insert("u1".into(), completed_state(NOW_MILLIS - 60_000));
+        // Webhook A is stamped first but its row lands late; webhook B,
+        // stamped 2 ms later, is already visible.
+        let stamped_a = NOW_MILLIS - 3_002;
+        let stamped_b = NOW_MILLIS - 3_000;
+        repository
+            .events
+            .lock()
+            .unwrap()
+            .push(event(8, "create", stamped_b));
+        let provider = Arc::new(FakeProvider {
+            details: HashMap::from([
+                (7, workout(7, "2026-10-05T06:00:00Z")),
+                (8, workout(8, "2026-10-06T06:00:00Z")),
+            ]),
+            ..FakeProvider::default()
+        });
+        let application = application(&repository, &history, &provider);
+
+        let report = application.import_tick(NOW_MILLIS, 10).await.unwrap();
+
+        // B is too recent to trust: nothing consumed, cursor not advanced.
+        assert!(provider.detail_requests.lock().unwrap().is_empty());
+        assert_eq!(
+            history.state("u1").unwrap().event_cursor_millis,
+            NOW_MILLIS - 60_000
+        );
+        // The user waits for B to settle instead of spinning more turns.
+        assert_eq!(report.turns, 1);
+        let entry = history.pending.lock().unwrap()["u1"].clone();
+        assert_eq!(
+            entry.retry_at_millis,
+            stamped_b + EVENT_VISIBILITY_GRACE_MILLIS
+        );
+
+        repository
+            .events
+            .lock()
+            .unwrap()
+            .push(event(7, "create", stamped_a));
+        application
+            .import_tick(entry.retry_at_millis, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(history.stored_ids(), ["strava:7", "strava:8"]);
+        assert_eq!(
+            history.state("u1").unwrap().event_cursor_millis,
+            stamped_b + 1
+        );
+        assert!(!history.is_pending("u1"));
+    }
+
+    #[tokio::test]
+    async fn new_import_starts_its_event_cursor_behind_the_grace_window() {
+        let repository = Arc::new(FakeRepository::new(vec![connection("u1", "42")], 10));
+        let history = Arc::new(FakeHistory::with_pending(&[("u1", 0)]));
+        let provider = Arc::new(FakeProvider::default());
+
+        application(&repository, &history, &provider)
+            .import_tick(NOW_MILLIS, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            history.state("u1").unwrap().event_cursor_millis,
+            NOW_MILLIS - EVENT_VISIBILITY_GRACE_MILLIS
+        );
+    }
+
+    #[tokio::test]
+    async fn touch_in_the_same_millisecond_during_a_turn_keeps_the_user_pending() {
+        let repository = Arc::new(FakeRepository::new(vec![connection("u1", "42")], 10));
+        let history = Arc::new(FakeHistory::default());
+        history
+            .states
+            .lock()
+            .unwrap()
+            .insert("u1".into(), completed_state(1_000));
+        history.mark_pending(&user("u1"), 5_000).await.unwrap();
+        // A second webhook touches the entry mid-turn with the same
+        // millisecond stamp as the touch the tick already read.
+        *history.touch_on_save_millis.lock().unwrap() = Some(5_000);
+        let provider = Arc::new(FakeProvider::default());
+
+        let report = application(&repository, &history, &provider)
+            .import_tick(NOW_MILLIS, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(report.completed, 1);
+        assert!(history.is_pending("u1"));
+        assert_eq!(history.pending.lock().unwrap()["u1"].touch_seq, 2);
     }
 }

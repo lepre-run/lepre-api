@@ -831,11 +831,13 @@ impl HistoryRepository for Store {
                 "SET user_id = :user_id, touched_at_millis = :now, \
                  last_turn_millis = if_not_exists(last_turn_millis, :zero), \
                  retry_at_millis = if_not_exists(retry_at_millis, :zero), \
-                 failures = if_not_exists(failures, :zero)",
+                 failures = if_not_exists(failures, :zero) \
+                 ADD touch_seq :one",
             )
             .expression_attribute_values(":user_id", AttributeValue::S(user_id.to_string()))
             .expression_attribute_values(":now", AttributeValue::N(now_millis.to_string()))
             .expression_attribute_values(":zero", AttributeValue::N("0".to_owned()))
+            .expression_attribute_values(":one", AttributeValue::N("1".to_owned()))
             .send()
             .await
             .context("dynamodb mark history import pending failed")?;
@@ -864,6 +866,7 @@ impl HistoryRepository for Store {
                 pending.push(PendingImport {
                     user_id: UserId::new(s(item, "user_id")?)?,
                     touched_at_millis: n(item, "touched_at_millis")?,
+                    touch_seq: optional_n(item, "touch_seq")?.unwrap_or(0),
                     last_turn_millis: n(item, "last_turn_millis")?,
                     retry_at_millis: n(item, "retry_at_millis")?,
                     failures: optional_n(item, "failures")?.unwrap_or(0),
@@ -912,19 +915,25 @@ impl HistoryRepository for Store {
     }
 
     async fn clear_pending(&self, pending: &PendingImport) -> Result<(), anyhow::Error> {
-        let result = self
+        // `touch_seq` only grows, so any touch after `pending` was read
+        // (even in the same millisecond) fails the condition.
+        let delete = self
             .client
             .delete_item()
             .table_name(&self.table)
             .key(PK, AttributeValue::S(HISTORY_PENDING_PK.to_owned()))
-            .key(SK, AttributeValue::S(user_pk(&pending.user_id)))
-            .condition_expression("touched_at_millis = :seen")
-            .expression_attribute_values(
-                ":seen",
-                AttributeValue::N(pending.touched_at_millis.to_string()),
-            )
-            .send()
-            .await;
+            .key(SK, AttributeValue::S(user_pk(&pending.user_id)));
+        let delete = if pending.touch_seq == 0 {
+            delete.condition_expression("attribute_not_exists(touch_seq)")
+        } else {
+            delete
+                .condition_expression("touch_seq = :seen")
+                .expression_attribute_values(
+                    ":seen",
+                    AttributeValue::N(pending.touch_seq.to_string()),
+                )
+        };
+        let result = delete.send().await;
         match result {
             Ok(_) => Ok(()),
             Err(error)
@@ -1555,7 +1564,8 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(operation("DeleteItem"))
-            .and(body_string_contains("touched_at_millis = :seen"))
+            .and(body_string_contains("touch_seq = :seen"))
+            .and(body_string_contains(r#"":seen":{"N":"3"}"#))
             .respond_with(dynamodb_json(
                 400,
                 r#"{"__type":"com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException","message":"The conditional request failed"}"#,
@@ -1568,10 +1578,29 @@ mod tests {
             .clear_pending(&PendingImport {
                 user_id: UserId::new("user-1").unwrap(),
                 touched_at_millis: 5,
+                touch_seq: 3,
                 last_turn_millis: 0,
                 retry_at_millis: 0,
                 failures: 0,
             })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn marking_pending_bumps_a_monotonic_touch_counter() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(operation("UpdateItem"))
+            .and(body_string_contains("ADD touch_seq :one"))
+            .and(body_string_contains(r#"":one":{"N":"1"}"#))
+            .respond_with(dynamodb_json(200, "{}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        test_store(&server)
+            .mark_pending(&UserId::new("user-1").unwrap(), 5)
             .await
             .unwrap();
     }
