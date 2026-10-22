@@ -973,6 +973,7 @@ impl HistoryRepository for Store {
                     event_cursor_millis: n(item, "event_cursor_millis")?,
                     imported_count: n(item, "imported_count")?,
                     started_at_millis: n(item, "started_at_millis")?,
+                    rev: optional_n(item, "rev")?.unwrap_or(0),
                     boundary_ids: match item.get("boundary_ids") {
                         None => Vec::new(),
                         Some(value) => value
@@ -996,18 +997,21 @@ impl HistoryRepository for Store {
         &self,
         user_id: &UserId,
         state: &ImportState,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<bool, anyhow::Error> {
         let status = match state.status {
             ImportStatus::InProgress => "in_progress",
             ImportStatus::Complete => "complete",
             ImportStatus::Failed => "failed",
         };
-        self.client
+        let put = self
+            .client
             .put_item()
             .table_name(&self.table)
             .item(PK, AttributeValue::S(user_pk(user_id)))
             .item(SK, AttributeValue::S(HISTORY_IMPORT_SK.to_owned()))
             .item("import_status", AttributeValue::S(status.to_owned()))
+            .item("rev", AttributeValue::N((state.rev + 1).to_string()))
+            .expression_attribute_names("#rev", "rev")
             .item(
                 "before_seconds",
                 AttributeValue::N(state.before_seconds.to_string()),
@@ -1033,11 +1037,25 @@ impl HistoryRepository for Store {
                         .map(|id| AttributeValue::N(id.to_string()))
                         .collect(),
                 ),
-            )
-            .send()
-            .await
-            .context("dynamodb save history import state failed")?;
-        Ok(())
+            );
+        // Only the run that read the current revision may move the cursors.
+        let put = if state.rev == 0 {
+            put.condition_expression("attribute_not_exists(#rev)")
+        } else {
+            put.condition_expression("#rev = :rev")
+                .expression_attribute_values(":rev", AttributeValue::N(state.rev.to_string()))
+        };
+        match put.send().await {
+            Ok(_) => Ok(true),
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(|value| value.is_conditional_check_failed_exception()) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error).context("dynamodb save history import state failed"),
+        }
     }
 
     async fn apply_workout_changes(
@@ -1221,17 +1239,30 @@ impl Store {
                         "payload".to_owned(),
                         AttributeValue::S(write.record.payload.clone()),
                     ),
-                ])))
-                .build()?;
+                ])));
+            // A concurrent writer that changed or created this workout first
+            // cancels the transaction, and the caller re-plans.
+            let put = match &write.expected_version {
+                Some(version) => put
+                    .condition_expression("sync_version = :expected")
+                    .expression_attribute_values(":expected", AttributeValue::S(version.clone())),
+                None => put.condition_expression("attribute_not_exists(sk)"),
+            }
+            .build()?;
             items.push(TransactWriteItem::builder().put(put).build());
         }
-        for id in &changes.workout_deletes {
+        for removal in &changes.workout_deletes {
             let delete = TransactDelete::builder()
                 .table_name(&self.table)
                 .set_key(Some(history_key(
                     user_id,
-                    format!("{WORKOUT_SK_PREFIX}{id}"),
+                    format!("{WORKOUT_SK_PREFIX}{}", removal.id),
                 )))
+                .condition_expression("sync_version = :expected")
+                .expression_attribute_values(
+                    ":expected",
+                    AttributeValue::S(removal.expected_version.clone()),
+                )
                 .build()?;
             items.push(TransactWriteItem::builder().delete(delete).build());
         }
@@ -1544,6 +1575,112 @@ mod tests {
         assert!(transaction.contains(r#""S":"MONTH#2026-10""#));
         assert!(transaction.contains("attribute_not_exists(#rev)"));
         assert!(transaction.contains(r#""rev":{"N":"1"}"#));
+        assert!(transaction.contains("attribute_not_exists(sk)"));
+    }
+
+    #[tokio::test]
+    async fn changed_and_removed_workouts_are_conditional_on_their_stored_version() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(operation("BatchGetItem"))
+            .and(body_string_contains("WORKOUT#"))
+            .respond_with(dynamodb_json(
+                200,
+                r#"{"Responses":{"table":[
+                    {"pk":{"S":"USER#user-1"},"sk":{"S":"WORKOUT#strava:1"},"month":{"S":"2026-10"},"sync_version":{"S":"old-1"},"fingerprint":{"S":"stale"}},
+                    {"pk":{"S":"USER#user-1"},"sk":{"S":"WORKOUT#strava:2"},"month":{"S":"2026-10"},"sync_version":{"S":"old-2"},"fingerprint":{"S":"x"}}
+                ]}}"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(operation("BatchGetItem"))
+            .and(body_string_contains("MONTH#"))
+            .respond_with(dynamodb_json(
+                200,
+                r#"{"Responses":{"table":[
+                    {"pk":{"S":"USER#user-1"},"sk":{"S":"MONTH#2026-10"},"month":{"S":"2026-10"},"members":{"M":{"strava:1":{"S":"old-1"},"strava:2":{"S":"old-2"}}},"rev":{"N":"4"}}
+                ]}}"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(operation("TransactWriteItems"))
+            .respond_with(dynamodb_json(200, "{}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        test_store(&server)
+            .apply_workout_changes(
+                &UserId::new("user-1").unwrap(),
+                vec![easy_run()],
+                vec![WorkoutId::new("strava:2").unwrap()],
+            )
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let transaction: serde_json::Value =
+            serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+        let items = transaction["TransactItems"].as_array().unwrap();
+        let put = items
+            .iter()
+            .find_map(|item| item.get("Put"))
+            .filter(|put| put["Item"]["sk"]["S"] == "WORKOUT#strava:1")
+            .expect("workout put");
+        assert_eq!(put["ConditionExpression"], "sync_version = :expected");
+        assert_eq!(put["ExpressionAttributeValues"][":expected"]["S"], "old-1");
+        let delete = items
+            .iter()
+            .find_map(|item| item.get("Delete"))
+            .filter(|delete| delete["Key"]["sk"]["S"] == "WORKOUT#strava:2")
+            .expect("workout delete");
+        assert_eq!(delete["ConditionExpression"], "sync_version = :expected");
+        assert_eq!(
+            delete["ExpressionAttributeValues"][":expected"]["S"],
+            "old-2"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_state_save_is_conditional_on_the_revision_it_read() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(operation("PutItem"))
+            .and(body_string_contains("attribute_not_exists(#rev)"))
+            .and(body_string_contains(r#""rev":{"N":"1"}"#))
+            .respond_with(dynamodb_json(200, "{}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(operation("PutItem"))
+            .and(body_string_contains("#rev = :rev"))
+            .and(body_string_contains(r#"":rev":{"N":"4"}"#))
+            .and(body_string_contains(r#""rev":{"N":"5"}"#))
+            .respond_with(dynamodb_json(
+                400,
+                r#"{"__type":"com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException","message":"The conditional request failed"}"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let store = test_store(&server);
+        let user = UserId::new("user-1").unwrap();
+        let mut state = ImportState {
+            status: ImportStatus::InProgress,
+            before_seconds: 7,
+            event_cursor_millis: 8,
+            imported_count: 0,
+            started_at_millis: 1,
+            boundary_ids: Vec::new(),
+            rev: 0,
+        };
+
+        assert!(store.save_import_state(&user, &state).await.unwrap());
+        state.rev = 4;
+        assert!(!store.save_import_state(&user, &state).await.unwrap());
     }
 
     #[tokio::test]
@@ -1640,6 +1777,7 @@ mod tests {
             imported_count: 2,
             started_at_millis: 1,
             boundary_ids: vec![10, 11],
+            rev: 0,
         };
 
         store.save_import_state(&user, &state).await.unwrap();

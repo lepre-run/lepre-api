@@ -109,6 +109,10 @@ pub struct ImportState {
     /// and skips these, so same-second activities split across a page
     /// boundary are not lost.
     pub boundary_ids: Vec<i64>,
+    /// Stored revision this state was read at (0 when not stored yet). A
+    /// save only succeeds while the stored revision is still this one, so an
+    /// overlapping run cannot move the cursors backwards.
+    pub rev: i64,
 }
 
 impl ImportState {
@@ -120,6 +124,7 @@ impl ImportState {
             imported_count: 0,
             started_at_millis: now_millis,
             boundary_ids: Vec::new(),
+            rev: 0,
         }
     }
 }
@@ -316,11 +321,13 @@ pub trait HistoryRepository: Send + Sync {
     /// Remove the entry unless it was touched after `pending` was read.
     async fn clear_pending(&self, pending: &PendingImport) -> Result<(), anyhow::Error>;
     async fn import_state(&self, user_id: &UserId) -> Result<Option<ImportState>, anyhow::Error>;
+    /// Store `state` unless another run saved since it was read (`state.rev`
+    /// no longer matches); returns whether it was stored.
     async fn save_import_state(
         &self,
         user_id: &UserId,
         state: &ImportState,
-    ) -> Result<(), anyhow::Error>;
+    ) -> Result<bool, anyhow::Error>;
     async fn apply_workout_changes(
         &self,
         user_id: &UserId,
@@ -377,6 +384,9 @@ enum TurnOutcome {
     },
     /// The history walk stalled; the import is marked `Failed`.
     Failed,
+    /// An overlapping run saved the import state first; this turn's state
+    /// was discarded.
+    Superseded,
 }
 
 impl Application {
@@ -734,6 +744,17 @@ impl Application {
                         entry.failures = 0;
                         next_round.push(entry);
                     }
+                    Ok(TurnOutcome::Superseded) => {
+                        tracing::warn!(
+                            event = "history_import_turn_superseded",
+                            user_id = %entry.user_id,
+                            "an overlapping run saved the import state first"
+                        );
+                        self.history
+                            .record_turn(&entry.user_id, now_millis, now_millis, entry.failures)
+                            .await
+                            .map_err(ApplicationError::Persistence)?;
+                    }
                     Ok(TurnOutcome::Failed) => {
                         report.failed += 1;
                         self.history
@@ -811,10 +832,15 @@ impl Application {
                 .map_err(ApplicationError::Persistence)?
                 .unwrap_or_else(|| ImportState::started(now_millis));
             state.status = ImportStatus::Failed;
-            self.history
+            let saved = self
+                .history
                 .save_import_state(&entry.user_id, &state)
                 .await
                 .map_err(ApplicationError::Persistence)?;
+            if !saved {
+                // An overlapping run moved the import on; retry next tick.
+                return Ok(false);
+            }
             self.history
                 .clear_pending(entry)
                 .await
@@ -933,10 +959,14 @@ impl Application {
                 }
             }
         }
-        self.history
+        let saved = self
+            .history
             .save_import_state(user_id, &state)
             .await
             .map_err(ApplicationError::Persistence)?;
+        if !saved {
+            return Ok(TurnOutcome::Superseded);
+        }
         let newest_recent = recent.iter().map(|event| event.received_at_millis).max();
         if state.status == ImportStatus::Failed {
             return Ok(TurnOutcome::Failed);
@@ -1299,9 +1329,29 @@ mod tests {
         /// When set, every `save_import_state` also touches the pending entry
         /// at this millisecond, like a webhook arriving during the turn.
         touch_on_save_millis: Mutex<Option<i64>>,
+        /// When set, the first `apply_workout_changes` saves this state as
+        /// an overlapping run would, before the turn saves its own.
+        rival_save_on_apply: Mutex<Option<ImportState>>,
     }
 
     impl FakeHistory {
+        /// The DynamoDB revision check: store only over the revision read.
+        fn store_state(&self, user_id: &UserId, state: &ImportState) -> bool {
+            let mut states = self.states.lock().unwrap();
+            let stored_rev = states.get(user_id.as_str()).map_or(0, |stored| stored.rev);
+            if stored_rev != state.rev {
+                return false;
+            }
+            states.insert(
+                user_id.to_string(),
+                ImportState {
+                    rev: state.rev + 1,
+                    ..state.clone()
+                },
+            );
+            true
+        }
+
         fn with_pending(entries: &[(&str, i64)]) -> Self {
             let history = Self::default();
             for (user_id, last_turn_millis) in entries {
@@ -1407,24 +1457,27 @@ mod tests {
             &self,
             user_id: &UserId,
             state: &ImportState,
-        ) -> Result<(), anyhow::Error> {
-            self.states
-                .lock()
-                .unwrap()
-                .insert(user_id.to_string(), state.clone());
+        ) -> Result<bool, anyhow::Error> {
+            if !self.store_state(user_id, state) {
+                return Ok(false);
+            }
             let touch = *self.touch_on_save_millis.lock().unwrap();
             if let Some(millis) = touch {
                 self.mark_pending(user_id, millis).await?;
             }
-            Ok(())
+            Ok(true)
         }
 
         async fn apply_workout_changes(
             &self,
-            _user_id: &UserId,
+            user_id: &UserId,
             upserts: Vec<Workout>,
             removals: Vec<WorkoutId>,
         ) -> Result<(), anyhow::Error> {
+            let rival = self.rival_save_on_apply.lock().unwrap().take();
+            if let Some(rival) = rival {
+                assert!(self.store_state(user_id, &rival));
+            }
             let records: Vec<_> = upserts.into_iter().filter_map(WorkoutRecord::new).collect();
             let removals: Vec<_> = removals.iter().map(ToString::to_string).collect();
             let mut workouts = self.workouts.lock().unwrap();
@@ -1456,8 +1509,8 @@ mod tests {
                     },
                 );
             }
-            for id in changes.workout_deletes {
-                workouts.remove(&id);
+            for removal in changes.workout_deletes {
+                workouts.remove(&removal.id);
             }
             for write in changes.month_writes {
                 if write.members.is_empty() {
@@ -1691,6 +1744,7 @@ mod tests {
                 imported_count: 2,
                 started_at_millis: 1_000,
                 boundary_ids: Vec::new(),
+                rev: 0,
             },
         );
         repository.events.lock().unwrap().extend([
@@ -2051,6 +2105,7 @@ mod tests {
                 imported_count: 4,
                 started_at_millis: 1_000,
                 boundary_ids: Vec::new(),
+                rev: 0,
             },
         );
         history.mark_pending(&user("u1"), 2_000).await.unwrap();
@@ -2063,6 +2118,55 @@ mod tests {
 
         assert_eq!(*provider.page_cursors.lock().unwrap(), [1_789_000_001]);
         assert_eq!(history.state("u1").unwrap().status, ImportStatus::Complete);
+    }
+
+    #[tokio::test]
+    async fn overlapping_run_cannot_move_the_cursor_backwards() {
+        let repository = Arc::new(FakeRepository::new(vec![connection("u1", "42")], 10));
+        let history = Arc::new(FakeHistory::default());
+        history.states.lock().unwrap().insert(
+            "u1".into(),
+            ImportState {
+                status: ImportStatus::InProgress,
+                before_seconds: 1_789_000_000,
+                event_cursor_millis: 1_000,
+                imported_count: 4,
+                started_at_millis: 1_000,
+                boundary_ids: Vec::new(),
+                rev: 0,
+            },
+        );
+        // While this turn runs, another run walks further back and saves.
+        let rival = ImportState {
+            status: ImportStatus::InProgress,
+            before_seconds: 1_700_000_000,
+            event_cursor_millis: 5_000,
+            imported_count: 14,
+            started_at_millis: 1_000,
+            boundary_ids: vec![99],
+            rev: 0,
+        };
+        *history.rival_save_on_apply.lock().unwrap() = Some(rival.clone());
+        history.mark_pending(&user("u1"), 2_000).await.unwrap();
+        let provider = Arc::new(FakeProvider::default());
+
+        application(&repository, &history, &provider)
+            .import_tick(NOW_MILLIS, 10)
+            .await
+            .unwrap();
+
+        // This turn's stale cursors (an empty page at 1_789_000_000 would
+        // have completed the import) are discarded; the rival's stand.
+        assert_eq!(*provider.page_cursors.lock().unwrap(), [1_789_000_001]);
+        assert_eq!(
+            history.state("u1").unwrap(),
+            ImportState { rev: 1, ..rival }
+        );
+        assert!(history.is_pending("u1"));
+        assert_eq!(
+            history.pending.lock().unwrap()["u1"].last_turn_millis,
+            NOW_MILLIS
+        );
     }
 
     #[tokio::test]
@@ -2129,6 +2233,7 @@ mod tests {
             imported_count: 0,
             started_at_millis: 1_000,
             boundary_ids: Vec::new(),
+            rev: 0,
         }
     }
 

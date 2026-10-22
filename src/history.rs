@@ -122,6 +122,16 @@ pub struct MonthState {
 pub struct WorkoutWrite {
     pub record: WorkoutRecord,
     pub sync_version: String,
+    /// The stored `sync_version` this write replaces; `None` for a workout
+    /// that must not exist yet.
+    pub expected_version: Option<String>,
+}
+
+/// Delete of a stored workout, only while it still has `expected_version`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkoutDelete {
+    pub id: String,
+    pub expected_version: String,
 }
 
 /// New contents of a month bucket. `expected_rev` is `None` for a month that
@@ -142,7 +152,7 @@ impl MonthWrite {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ChangeSet {
     pub workout_writes: Vec<WorkoutWrite>,
-    pub workout_deletes: Vec<String>,
+    pub workout_deletes: Vec<WorkoutDelete>,
     pub month_writes: Vec<MonthWrite>,
 }
 
@@ -196,7 +206,10 @@ pub fn plan_changes(
                 .or_insert_with(|| month_members(&state.month))
                 .remove(id);
             dirty.insert(state.month.clone());
-            changes.workout_deletes.push(id.clone());
+            changes.workout_deletes.push(WorkoutDelete {
+                id: id.clone(),
+                expected_version: state.sync_version.clone(),
+            });
         }
     }
 
@@ -233,6 +246,7 @@ pub fn plan_changes(
             changes.workout_writes.push(WorkoutWrite {
                 record,
                 sync_version,
+                expected_version: previous.map(|state| state.sync_version.clone()),
             });
         }
     }
@@ -413,6 +427,7 @@ mod tests {
         );
         assert_eq!(changes.workout_writes.len(), 1);
         assert_eq!(changes.workout_writes[0].sync_version, "v1");
+        assert_eq!(changes.workout_writes[0].expected_version, None);
         assert_eq!(
             changes.month_writes,
             vec![MonthWrite {
@@ -452,6 +467,10 @@ mod tests {
         )]);
         let changes = plan_changes(&existing, &months, vec![after], &[], versions());
         assert_eq!(changes.workout_writes[0].sync_version, "v1");
+        assert_eq!(
+            changes.workout_writes[0].expected_version.as_deref(),
+            Some("old")
+        );
         assert_eq!(changes.month_writes[0].expected_rev, Some(3));
         assert_eq!(changes.month_writes[0].members["strava:1"], "v1");
     }
@@ -501,7 +520,13 @@ mod tests {
             &["strava:1".to_owned(), "strava:9".to_owned()],
             versions(),
         );
-        assert_eq!(changes.workout_deletes, ["strava:1"]);
+        assert_eq!(
+            changes.workout_deletes,
+            [WorkoutDelete {
+                id: "strava:1".into(),
+                expected_version: "a".into(),
+            }]
+        );
         assert_eq!(
             changes.month_writes[0].members,
             BTreeMap::from([("strava:2".into(), "v1".into())])

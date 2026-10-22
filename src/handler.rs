@@ -1294,7 +1294,7 @@ mod tests {
             &self,
             _user_id: &UserId,
             _state: &ImportState,
-        ) -> Result<(), anyhow::Error> {
+        ) -> Result<bool, anyhow::Error> {
             unimplemented!("save_import_state unused in webhook tests")
         }
 
