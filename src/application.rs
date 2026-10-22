@@ -726,7 +726,7 @@ impl Application {
                 }
                 report.turns += 1;
                 match self
-                    .import_turn(&entry.user_id, &access_token, now_millis)
+                    .import_turn(&entry.user_id, access_token, now_millis)
                     .await
                 {
                     Ok(TurnOutcome::Finished) => {
@@ -868,12 +868,19 @@ impl Application {
 
     /// One quota turn for one user: pending webhook events first, then the
     /// next page of history.
+    ///
+    /// The first 401 in a turn forces one token refresh and retries that
+    /// request on the same quota reservation; see `recover_unauthorized`.
     async fn import_turn(
         &self,
         user_id: &UserId,
-        access_token: &str,
+        access_token: String,
         now_millis: i64,
     ) -> Result<TurnOutcome, ApplicationError> {
+        let mut token = TurnToken {
+            access_token,
+            refreshed: false,
+        };
         let mut state = self
             .history
             .import_state(user_id)
@@ -901,12 +908,20 @@ impl Application {
                 removals.push(workout_id);
                 continue;
             }
-            match self
-                .provider
-                .workout(access_token, event.external_workout_id)
-                .await
-                .map_err(provider_error)?
-            {
+            let fetched = loop {
+                match self
+                    .provider
+                    .workout(&token.access_token, event.external_workout_id)
+                    .await
+                {
+                    Ok(fetched) => break fetched,
+                    Err(error) => {
+                        self.recover_unauthorized(user_id, &mut token, error)
+                            .await?
+                    }
+                }
+            };
+            match fetched {
                 Some(workout) => upserts.push(workout),
                 None => removals.push(workout_id),
             }
@@ -921,11 +936,23 @@ impl Application {
             state.status = ImportStatus::InProgress;
             // Re-list the boundary second and skip what is already imported:
             // Strava's `before` is strict and pages hold 10 activities.
-            let page = self
-                .provider
-                .history_page(access_token, state.before_seconds + 1, &state.boundary_ids)
-                .await
-                .map_err(provider_error)?;
+            let page = loop {
+                match self
+                    .provider
+                    .history_page(
+                        &token.access_token,
+                        state.before_seconds + 1,
+                        &state.boundary_ids,
+                    )
+                    .await
+                {
+                    Ok(page) => break page,
+                    Err(error) => {
+                        self.recover_unauthorized(user_id, &mut token, error)
+                            .await?
+                    }
+                }
+            };
             match page.oldest_start_seconds {
                 None => state.status = ImportStatus::Complete,
                 Some(oldest) if page.new_activities == 0 || oldest > state.before_seconds => {
@@ -985,6 +1012,75 @@ impl Application {
         )
     }
 
+    /// Handle a failed provider call in an import turn. `Ok(())` means retry
+    /// the call with the refreshed `token`.
+    ///
+    /// A 401 can just mean the access token expired after it was checked, so
+    /// the first one in a turn forces a refresh (persisted like any other) and
+    /// the call is retried once. Only a refused refresh, or a 401 with the
+    /// refreshed token, is reported as a revoked authorization. Every other
+    /// error is returned as is.
+    async fn recover_unauthorized(
+        &self,
+        user_id: &UserId,
+        token: &mut TurnToken,
+        error: anyhow::Error,
+    ) -> Result<(), ApplicationError> {
+        if token.refreshed || error.downcast_ref::<ProviderAuthRevoked>().is_none() {
+            return Err(provider_error(error));
+        }
+        token.refreshed = true;
+        tracing::info!(
+            event = "history_import_token_rejected",
+            "Strava rejected the access token mid-turn; refreshing it once"
+        );
+        token.access_token = self
+            .forced_access_token(user_id, &token.access_token)
+            .await?;
+        Ok(())
+    }
+
+    /// A replacement for the `rejected` access token, refreshed even if it
+    /// does not look expired yet. Another writer's newer token is used as is.
+    async fn forced_access_token(
+        &self,
+        user_id: &UserId,
+        rejected: &str,
+    ) -> Result<String, ApplicationError> {
+        for _ in 0..2 {
+            let connection = self
+                .repository
+                .connection_for_user(user_id)
+                .await
+                .map_err(ApplicationError::Persistence)?
+                .ok_or_else(|| ApplicationError::Provider(ProviderAuthRevoked.into()))?;
+            if connection.credentials.access_token != rejected {
+                return Ok(connection.credentials.access_token);
+            }
+            let refreshed = self
+                .provider
+                .refresh(&connection.credentials.refresh_token)
+                .await
+                .map_err(provider_error)?;
+            let replacement = StoredProviderConnection {
+                credentials: refreshed.clone(),
+                token_version: connection.token_version + 1,
+                ..connection.clone()
+            };
+            if self
+                .repository
+                .replace_credentials(&replacement, connection.token_version)
+                .await
+                .map_err(ApplicationError::Persistence)?
+            {
+                return Ok(refreshed.access_token);
+            }
+        }
+        Err(ApplicationError::Provider(anyhow::anyhow!(
+            "concurrent token refresh did not settle"
+        )))
+    }
+
     async fn authenticate(
         &self,
         raw_session: &str,
@@ -1040,6 +1136,13 @@ impl Application {
             "concurrent token refresh did not settle"
         )))
     }
+}
+
+/// The access token an import turn uses, and whether this turn already
+/// forced a refresh after a 401.
+struct TurnToken {
+    access_token: String,
+    refreshed: bool,
 }
 
 fn coalesce_events(events: Vec<ProviderEvent>) -> Vec<ProviderEvent> {
@@ -1193,7 +1296,7 @@ mod tests {
     }
 
     struct FakeRepository {
-        connections: Vec<StoredProviderConnection>,
+        connections: Mutex<Vec<StoredProviderConnection>>,
         events: Mutex<Vec<ProviderEvent>>,
         grants_left: Mutex<usize>,
         turn_requests: Mutex<Vec<UserId>>,
@@ -1202,7 +1305,7 @@ mod tests {
     impl FakeRepository {
         fn new(connections: Vec<StoredProviderConnection>, grants: usize) -> Self {
             Self {
-                connections,
+                connections: Mutex::new(connections),
                 events: Mutex::new(Vec::new()),
                 grants_left: Mutex::new(grants),
                 turn_requests: Mutex::new(Vec::new()),
@@ -1219,6 +1322,8 @@ mod tests {
         ) -> Result<Option<StoredProviderConnection>, anyhow::Error> {
             Ok(self
                 .connections
+                .lock()
+                .unwrap()
                 .iter()
                 .find(|stored| stored.connection.external_account_id == *external_account_id)
                 .cloned())
@@ -1230,6 +1335,8 @@ mod tests {
         ) -> Result<Option<StoredProviderConnection>, anyhow::Error> {
             Ok(self
                 .connections
+                .lock()
+                .unwrap()
                 .iter()
                 .find(|stored| stored.user_id == *user_id)
                 .cloned())
@@ -1244,10 +1351,21 @@ mod tests {
 
         async fn replace_credentials(
             &self,
-            _connection: &StoredProviderConnection,
-            _expected_version: i64,
+            connection: &StoredProviderConnection,
+            expected_version: i64,
         ) -> Result<bool, anyhow::Error> {
-            unimplemented!("replace_credentials unused in import tests")
+            let mut connections = self.connections.lock().unwrap();
+            let Some(stored) = connections
+                .iter_mut()
+                .find(|stored| stored.user_id == connection.user_id)
+            else {
+                return Ok(false);
+            };
+            if stored.token_version != expected_version {
+                return Ok(false);
+            }
+            *stored = connection.clone();
+            Ok(true)
         }
 
         async fn delete_connection(&self, _user_id: &UserId) -> Result<(), anyhow::Error> {
@@ -1537,6 +1655,10 @@ mod tests {
         detail_requests: Mutex<Vec<i64>>,
         refresh_error: Mutex<Option<anyhow::Error>>,
         refresh_requests: Mutex<usize>,
+        /// Access tokens Strava answers with 401.
+        rejected_tokens: Vec<&'static str>,
+        /// Access tokens used for API calls, in order.
+        used_tokens: Mutex<Vec<String>>,
         /// When non-empty, `history_page` lists from this simulated Strava
         /// account (`(id, start_date)` runs) instead of `pages`.
         catalog: Vec<(i64, &'static str)>,
@@ -1545,6 +1667,17 @@ mod tests {
     }
 
     impl FakeProvider {
+        fn check_token(&self, access_token: &str) -> Result<(), anyhow::Error> {
+            self.used_tokens
+                .lock()
+                .unwrap()
+                .push(access_token.to_owned());
+            if self.rejected_tokens.contains(&access_token) {
+                return Err(ProviderAuthRevoked.into());
+            }
+            Ok(())
+        }
+
         fn with_pages(pages: Vec<ProviderHistoryPage>) -> Self {
             Self {
                 pages: Mutex::new(pages.into_iter().map(Ok).collect()),
@@ -1621,7 +1754,11 @@ mod tests {
             *self.refresh_requests.lock().unwrap() += 1;
             match self.refresh_error.lock().unwrap().take() {
                 Some(error) => Err(error),
-                None => unimplemented!("successful refresh unused in import tests"),
+                None => Ok(ProviderCredentials {
+                    access_token: "fresh".into(),
+                    refresh_token: "refresh-2".into(),
+                    expires_at: i64::MAX,
+                }),
             }
         }
 
@@ -1637,9 +1774,10 @@ mod tests {
 
         async fn workout(
             &self,
-            _access_token: &str,
+            access_token: &str,
             external_workout_id: i64,
         ) -> Result<Option<Workout>, anyhow::Error> {
+            self.check_token(access_token)?;
             self.detail_requests
                 .lock()
                 .unwrap()
@@ -1649,10 +1787,11 @@ mod tests {
 
         async fn history_page(
             &self,
-            _access_token: &str,
+            access_token: &str,
             before_seconds: i64,
             skip_ids: &[i64],
         ) -> Result<ProviderHistoryPage, anyhow::Error> {
+            self.check_token(access_token)?;
             self.page_cursors.lock().unwrap().push(before_seconds);
             self.skip_lists.lock().unwrap().push(skip_ids.to_vec());
             if !self.catalog.is_empty() {
@@ -2020,6 +2159,7 @@ mod tests {
         let history = Arc::new(FakeHistory::with_pending(&[("u1", 0)]));
         let provider = Arc::new(FakeProvider {
             pages: Mutex::new(VecDeque::from([Err(ProviderAuthRevoked.into())])),
+            refresh_error: Mutex::new(Some(ProviderAuthRevoked.into())),
             ..FakeProvider::default()
         });
         let application = application(&repository, &history, &provider);
@@ -2038,6 +2178,101 @@ mod tests {
             assert_eq!(report.turns, 0);
         }
         assert_eq!(repository.turn_requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn token_expiring_mid_run_is_refreshed_and_the_import_continues() {
+        let repository = Arc::new(FakeRepository::new(vec![connection("u1", "42")], 10));
+        let history = Arc::new(FakeHistory::with_pending(&[("u1", 0)]));
+        let provider = Arc::new(FakeProvider {
+            rejected_tokens: vec!["access"],
+            ..FakeProvider::with_pages(vec![history_page(
+                vec![workout(1, "2026-07-14T06:00:00Z")],
+                1_784_008_800,
+            )])
+        });
+
+        let report = application(&repository, &history, &provider)
+            .import_tick(NOW_MILLIS, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.completed, 1);
+        assert_eq!(*provider.refresh_requests.lock().unwrap(), 1);
+        assert_eq!(
+            *provider.used_tokens.lock().unwrap(),
+            ["access", "fresh", "fresh"]
+        );
+        // Two turns (the page, then the empty end page), one reservation
+        // each: the retry rides on the first turn's reservation.
+        assert_eq!(report.turns, 2);
+        assert_eq!(repository.turn_requests.lock().unwrap().len(), 2);
+        let state = history.state("u1").unwrap();
+        assert_eq!(state.status, ImportStatus::Complete);
+        assert_eq!(state.imported_count, 1);
+        let stored = repository.connections.lock().unwrap()[0].clone();
+        assert_eq!(stored.credentials.access_token, "fresh");
+        assert_eq!(stored.credentials.refresh_token, "refresh-2");
+        assert_eq!(stored.token_version, 2);
+    }
+
+    #[tokio::test]
+    async fn token_still_rejected_after_a_refresh_fails_the_import() {
+        let repository = Arc::new(FakeRepository::new(vec![connection("u1", "42")], 10));
+        let history = Arc::new(FakeHistory::with_pending(&[("u1", 0)]));
+        let provider = Arc::new(FakeProvider {
+            rejected_tokens: vec!["access", "fresh"],
+            ..FakeProvider::default()
+        });
+
+        let report = application(&repository, &history, &provider)
+            .import_tick(NOW_MILLIS, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(report.failed, 1);
+        assert_eq!(*provider.refresh_requests.lock().unwrap(), 1);
+        assert_eq!(*provider.used_tokens.lock().unwrap(), ["access", "fresh"]);
+        assert_eq!(repository.turn_requests.lock().unwrap().len(), 1);
+        assert_eq!(history.state("u1").unwrap().status, ImportStatus::Failed);
+        assert!(!history.is_pending("u1"));
+    }
+
+    #[tokio::test]
+    async fn refused_refresh_after_a_mid_run_rejection_fails_the_import() {
+        let repository = Arc::new(FakeRepository::new(vec![connection("u1", "42")], 10));
+        repository
+            .events
+            .lock()
+            .unwrap()
+            .push(event(7, "create", 2_000));
+        let history = Arc::new(FakeHistory::with_pending(&[("u1", 0)]));
+        history
+            .states
+            .lock()
+            .unwrap()
+            .insert("u1".into(), completed_state(1_000));
+        let provider = Arc::new(FakeProvider {
+            rejected_tokens: vec!["access"],
+            refresh_error: Mutex::new(Some(ProviderAuthRevoked.into())),
+            ..FakeProvider::default()
+        });
+
+        let report = application(&repository, &history, &provider)
+            .import_tick(NOW_MILLIS, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(report.failed, 1);
+        assert_eq!(*provider.refresh_requests.lock().unwrap(), 1);
+        assert_eq!(*provider.used_tokens.lock().unwrap(), ["access"]);
+        assert_eq!(repository.turn_requests.lock().unwrap().len(), 1);
+        assert_eq!(history.state("u1").unwrap().status, ImportStatus::Failed);
+        assert!(!history.is_pending("u1"));
+        let stored = repository.connections.lock().unwrap()[0].clone();
+        assert_eq!(stored.credentials.access_token, "access");
+        assert_eq!(stored.token_version, 1);
     }
 
     #[tokio::test]
