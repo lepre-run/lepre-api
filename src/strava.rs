@@ -384,6 +384,17 @@ impl Provider for StravaProvider {
                 reqwest::StatusCode::BAD_REQUEST
             )
         }
+        // A 401/403 from the token endpoint rejects the app's own client
+        // credentials, not the user's refresh token: retry later instead of
+        // failing every user's import.
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Strava token endpoint returned {status}: {body}")
+        }
         let response: RefreshedTokenDto = checked_json_body(response).await?;
         Ok(ProviderCredentials {
             access_token: response.access_token,
@@ -1053,6 +1064,14 @@ mod tests {
                 }),
             ),
             (500, serde_json::json!({"message":"error"})),
+            (
+                401,
+                serde_json::json!({
+                    "message":"Authorization Error",
+                    "errors":[{"resource":"Application","field":"client_secret","code":"invalid"}]
+                }),
+            ),
+            (403, serde_json::json!({"message":"Forbidden"})),
         ] {
             let server = MockServer::start().await;
             Mock::given(method("POST"))

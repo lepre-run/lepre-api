@@ -27,7 +27,16 @@ const MAX_FAILED_TURN_BACKOFF_MILLIS: i64 = 6 * 60 * 60 * 1_000;
 /// cursor past `now - EVENT_VISIBILITY_GRACE_MILLIS`, so a late row is still
 /// read on a later turn.
 const EVENT_VISIBILITY_GRACE_MILLIS: i64 = 10_000;
+/// An HTTP request refreshes a token expiring within this many seconds.
+const REQUEST_TOKEN_MARGIN_SECONDS: i64 = 60;
+/// An import turn refreshes a token expiring within this many seconds, so it
+/// cannot run out while the turn's Strava calls are still in flight.
+const IMPORT_TOKEN_MARGIN_SECONDS: i64 = 10 * 60;
 pub const SYNC_BATCH_REQUEST_COST: i64 = 21;
+/// Strava reads of one history page: the list plus up to 10 details.
+const HISTORY_PAGE_REQUEST_COST: i64 = 11;
+/// Strava reads of one activity detail.
+const WORKOUT_REQUEST_COST: i64 = 1;
 
 #[derive(Debug, Clone)]
 pub struct ProviderCredentials {
@@ -275,6 +284,10 @@ pub trait Repository: Send + Sync {
         now_millis: i64,
         config: &SyncGateConfig,
     ) -> Result<SyncTurn, anyhow::Error>;
+    /// Book `reads` extra Strava reads against the shared quota windows,
+    /// without a limit check: they are spent beyond a granted turn's
+    /// reservation, e.g. when a request is retried after a token refresh.
+    async fn charge_reads(&self, now_millis: i64, reads: i64) -> Result<(), anyhow::Error>;
 }
 
 #[async_trait]
@@ -514,7 +527,9 @@ impl Application {
             }
         }
         let connection = self.connection(&user_id).await?;
-        let access_token = self.valid_access_token(connection, now_seconds).await?;
+        let access_token = self
+            .valid_access_token(connection, now_seconds, REQUEST_TOKEN_MARGIN_SECONDS)
+            .await?;
         let before = request.snapshot_millis / 1000 + 1;
         let (mut workouts, event_offset) = match request.phase.clone() {
             SyncPhase::Activities { page } => {
@@ -606,7 +621,10 @@ impl Application {
             return Ok(());
         };
         let connection = self.connection(&user_id).await?;
-        if let Ok(access) = self.valid_access_token(connection, now_seconds).await {
+        if let Ok(access) = self
+            .valid_access_token(connection, now_seconds, REQUEST_TOKEN_MARGIN_SECONDS)
+            .await
+        {
             let _ = self.provider.deauthorize(&access).await;
         }
         self.repository
@@ -680,12 +698,23 @@ impl Application {
         now_millis: i64,
         max_turns: usize,
     ) -> Result<ImportTickReport, ApplicationError> {
+        self.import_tick_with_clock(&|| now_millis, max_turns).await
+    }
+
+    /// `import_tick` reading `clock` (epoch milliseconds) once per turn, so a
+    /// long tick neither checks tokens nor stamps turns with a stale time.
+    pub async fn import_tick_with_clock(
+        &self,
+        clock: &(dyn Fn() -> i64 + Send + Sync),
+        max_turns: usize,
+    ) -> Result<ImportTickReport, ApplicationError> {
+        let tick_started_millis = clock();
         let mut pending = self
             .history
             .pending_imports()
             .await
             .map_err(ApplicationError::Persistence)?;
-        pending.retain(|entry| entry.retry_at_millis <= now_millis);
+        pending.retain(|entry| entry.retry_at_millis <= tick_started_millis);
         pending.sort_by_key(|entry| (entry.last_turn_millis, entry.touched_at_millis));
         let mut report = ImportTickReport::default();
         while !pending.is_empty() {
@@ -693,6 +722,26 @@ impl Application {
             for mut entry in pending {
                 if report.turns >= max_turns {
                     return Ok(report);
+                }
+                let now_millis = clock();
+                // A complete import with no settled events needs no Strava
+                // call: settle it without a token or a quota reservation.
+                match self.idle_outcome(&entry.user_id, now_millis).await? {
+                    Some(TurnOutcome::Finished) => {
+                        self.history
+                            .clear_pending(&entry)
+                            .await
+                            .map_err(ApplicationError::Persistence)?;
+                        continue;
+                    }
+                    Some(TurnOutcome::WaitForEvents { retry_at_millis }) => {
+                        self.history
+                            .record_turn(&entry.user_id, now_millis, retry_at_millis, 0)
+                            .await
+                            .map_err(ApplicationError::Persistence)?;
+                        continue;
+                    }
+                    _ => {}
                 }
                 // Settle the token before reserving quota: a refresh does not
                 // use the read budget, so a dead token never reserves reads.
@@ -782,6 +831,47 @@ impl Application {
         Ok(report)
     }
 
+    /// What a turn would conclude without calling Strava, if anything: a
+    /// complete import with no events is finished, and one whose events are
+    /// all still inside the visibility grace waits for them.
+    async fn idle_outcome(
+        &self,
+        user_id: &UserId,
+        now_millis: i64,
+    ) -> Result<Option<TurnOutcome>, ApplicationError> {
+        let Some(state) = self
+            .history
+            .import_state(user_id)
+            .await
+            .map_err(ApplicationError::Persistence)?
+        else {
+            return Ok(None);
+        };
+        if state.status != ImportStatus::Complete {
+            return Ok(None);
+        }
+        let events = self
+            .repository
+            .events(user_id, state.event_cursor_millis, now_millis)
+            .await
+            .map_err(ApplicationError::Persistence)?;
+        let settled_through_millis = now_millis - EVENT_VISIBILITY_GRACE_MILLIS;
+        if events
+            .iter()
+            .any(|event| event.received_at_millis <= settled_through_millis)
+        {
+            return Ok(None);
+        }
+        Ok(Some(
+            match events.iter().map(|event| event.received_at_millis).max() {
+                None => TurnOutcome::Finished,
+                Some(newest) => TurnOutcome::WaitForEvents {
+                    retry_at_millis: newest + EVENT_VISIBILITY_GRACE_MILLIS,
+                },
+            },
+        ))
+    }
+
     /// A valid access token for the user's next turn, refreshed if needed, or
     /// `None` when the user is no longer connected.
     async fn turn_access_token(
@@ -797,7 +887,7 @@ impl Application {
         else {
             return Ok(None);
         };
-        self.valid_access_token(connection, now_millis / 1_000)
+        self.valid_access_token(connection, now_millis / 1_000, IMPORT_TOKEN_MARGIN_SECONDS)
             .await
             .map(Some)
     }
@@ -916,8 +1006,14 @@ impl Application {
                 {
                     Ok(fetched) => break fetched,
                     Err(error) => {
-                        self.recover_unauthorized(user_id, &mut token, error)
-                            .await?
+                        self.recover_unauthorized(
+                            user_id,
+                            &mut token,
+                            error,
+                            WORKOUT_REQUEST_COST,
+                            now_millis,
+                        )
+                        .await?
                     }
                 }
             };
@@ -948,8 +1044,14 @@ impl Application {
                 {
                     Ok(page) => break page,
                     Err(error) => {
-                        self.recover_unauthorized(user_id, &mut token, error)
-                            .await?
+                        self.recover_unauthorized(
+                            user_id,
+                            &mut token,
+                            error,
+                            HISTORY_PAGE_REQUEST_COST,
+                            now_millis,
+                        )
+                        .await?
                     }
                 }
             };
@@ -1025,6 +1127,8 @@ impl Application {
         user_id: &UserId,
         token: &mut TurnToken,
         error: anyhow::Error,
+        retry_cost: i64,
+        now_millis: i64,
     ) -> Result<(), ApplicationError> {
         if token.refreshed || error.downcast_ref::<ProviderAuthRevoked>().is_none() {
             return Err(provider_error(error));
@@ -1037,6 +1141,11 @@ impl Application {
         token.access_token = self
             .forced_access_token(user_id, &token.access_token)
             .await?;
+        // The retry is not covered by the turn's reservation.
+        self.repository
+            .charge_reads(now_millis, retry_cost)
+            .await
+            .map_err(ApplicationError::Persistence)?;
         Ok(())
     }
 
@@ -1107,9 +1216,10 @@ impl Application {
         &self,
         mut connection: StoredProviderConnection,
         now_seconds: i64,
+        margin_seconds: i64,
     ) -> Result<String, ApplicationError> {
         for _ in 0..2 {
-            if connection.credentials.expires_at > now_seconds + 60 {
+            if connection.credentials.expires_at > now_seconds.saturating_add(margin_seconds) {
                 return Ok(connection.credentials.access_token);
             }
             let refreshed = self
@@ -1300,6 +1410,7 @@ mod tests {
         events: Mutex<Vec<ProviderEvent>>,
         grants_left: Mutex<usize>,
         turn_requests: Mutex<Vec<UserId>>,
+        charged_reads: Mutex<i64>,
     }
 
     impl FakeRepository {
@@ -1309,6 +1420,7 @@ mod tests {
                 events: Mutex::new(Vec::new()),
                 grants_left: Mutex::new(grants),
                 turn_requests: Mutex::new(Vec::new()),
+                charged_reads: Mutex::new(0),
             }
         }
     }
@@ -1434,6 +1546,11 @@ mod tests {
             }
             *grants_left -= 1;
             Ok(SyncTurn::Granted)
+        }
+
+        async fn charge_reads(&self, _now_millis: i64, reads: i64) -> Result<(), anyhow::Error> {
+            *self.charged_reads.lock().unwrap() += reads;
+            Ok(())
         }
     }
 
@@ -2208,6 +2325,11 @@ mod tests {
         // each: the retry rides on the first turn's reservation.
         assert_eq!(report.turns, 2);
         assert_eq!(repository.turn_requests.lock().unwrap().len(), 2);
+        // The retried page is charged on top of the reservation.
+        assert_eq!(
+            *repository.charged_reads.lock().unwrap(),
+            HISTORY_PAGE_REQUEST_COST
+        );
         let state = history.state("u1").unwrap();
         assert_eq!(state.status, ImportStatus::Complete);
         assert_eq!(state.imported_count, 1);
@@ -2215,6 +2337,82 @@ mod tests {
         assert_eq!(stored.credentials.access_token, "fresh");
         assert_eq!(stored.credentials.refresh_token, "refresh-2");
         assert_eq!(stored.token_version, 2);
+    }
+
+    #[tokio::test]
+    async fn rejected_detail_call_is_refreshed_retried_and_charged() {
+        let repository = Arc::new(FakeRepository::new(vec![connection("u1", "42")], 10));
+        let history = Arc::new(FakeHistory::with_pending(&[("u1", 0)]));
+        history.states.lock().unwrap().insert(
+            "u1".into(),
+            ImportState {
+                status: ImportStatus::Complete,
+                before_seconds: 0,
+                event_cursor_millis: 1_000,
+                imported_count: 0,
+                started_at_millis: 1_000,
+                boundary_ids: Vec::new(),
+                rev: 0,
+            },
+        );
+        repository
+            .events
+            .lock()
+            .unwrap()
+            .push(event(5, "create", 2_000));
+        let provider = Arc::new(FakeProvider {
+            rejected_tokens: vec!["access"],
+            details: HashMap::from([(5, workout(5, "2026-10-05T06:00:00Z"))]),
+            ..FakeProvider::default()
+        });
+
+        let report = application(&repository, &history, &provider)
+            .import_tick(NOW_MILLIS, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(report.failed, 0);
+        assert_eq!(history.stored_ids(), ["strava:5"]);
+        assert_eq!(*provider.used_tokens.lock().unwrap(), ["access", "fresh"]);
+        assert_eq!(
+            *repository.charged_reads.lock().unwrap(),
+            WORKOUT_REQUEST_COST
+        );
+        assert!(!history.is_pending("u1"));
+    }
+
+    #[tokio::test]
+    async fn each_turn_reads_the_clock_and_refreshes_tokens_close_to_expiry() {
+        let mut soon_expiring = connection("u1", "42");
+        soon_expiring.credentials.expires_at = NOW_MILLIS / 1_000 + 700;
+        let repository = Arc::new(FakeRepository::new(vec![soon_expiring], 10));
+        let history = Arc::new(FakeHistory::with_pending(&[("u1", 0)]));
+        let provider = Arc::new(FakeProvider::with_pages(vec![history_page(
+            vec![workout(1, "2026-07-14T06:00:00Z")],
+            1_784_008_800,
+        )]));
+        // 200 s pass between the two turns.
+        let reads = std::sync::atomic::AtomicI64::new(0);
+        let clock = || {
+            let read = reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if read < 2 {
+                NOW_MILLIS
+            } else {
+                NOW_MILLIS + 200_000
+            }
+        };
+
+        let report = application(&repository, &history, &provider)
+            .import_tick_with_clock(&clock, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(report.turns, 2);
+        assert_eq!(report.completed, 1);
+        // 700 s left at the first turn: no refresh. 500 s left at the second,
+        // under the 10-minute margin: refreshed before calling Strava.
+        assert_eq!(*provider.refresh_requests.lock().unwrap(), 1);
+        assert_eq!(*provider.used_tokens.lock().unwrap(), ["access", "fresh"]);
     }
 
     #[tokio::test]
@@ -2507,8 +2705,10 @@ mod tests {
             history.state("u1").unwrap().event_cursor_millis,
             NOW_MILLIS - 60_000
         );
-        // The user waits for B to settle instead of spinning more turns.
-        assert_eq!(report.turns, 1);
+        // The user waits for B to settle instead of spinning more turns, and
+        // reserves no quota for the wait.
+        assert_eq!(report.turns, 0);
+        assert!(repository.turn_requests.lock().unwrap().is_empty());
         let entry = history.pending.lock().unwrap()["u1"].clone();
         assert_eq!(
             entry.retry_at_millis,
@@ -2530,6 +2730,28 @@ mod tests {
             history.state("u1").unwrap().event_cursor_millis,
             stamped_b + 1
         );
+        assert!(!history.is_pending("u1"));
+    }
+
+    #[tokio::test]
+    async fn complete_import_with_no_events_leaves_without_reserving_quota() {
+        let repository = Arc::new(FakeRepository::new(vec![connection("u1", "42")], 10));
+        let history = Arc::new(FakeHistory::with_pending(&[("u1", 0)]));
+        history
+            .states
+            .lock()
+            .unwrap()
+            .insert("u1".into(), completed_state(1_000));
+        let provider = Arc::new(FakeProvider::default());
+
+        let report = application(&repository, &history, &provider)
+            .import_tick(NOW_MILLIS, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(report.turns, 0);
+        assert!(repository.turn_requests.lock().unwrap().is_empty());
+        assert!(provider.used_tokens.lock().unwrap().is_empty());
         assert!(!history.is_pending("u1"));
     }
 
@@ -2563,7 +2785,16 @@ mod tests {
         // A second webhook touches the entry mid-turn with the same
         // millisecond stamp as the touch the tick already read.
         *history.touch_on_save_millis.lock().unwrap() = Some(5_000);
-        let provider = Arc::new(FakeProvider::default());
+        // A settled event, so the tick runs a real turn.
+        repository
+            .events
+            .lock()
+            .unwrap()
+            .push(event(5, "create", 2_000));
+        let provider = Arc::new(FakeProvider {
+            details: HashMap::from([(5, workout(5, "2026-10-05T06:00:00Z"))]),
+            ..FakeProvider::default()
+        });
 
         let report = application(&repository, &history, &provider)
             .import_tick(NOW_MILLIS, 1)

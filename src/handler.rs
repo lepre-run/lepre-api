@@ -1189,6 +1189,10 @@ mod tests {
         ) -> Result<SyncTurn, anyhow::Error> {
             Ok(SyncTurn::Granted)
         }
+
+        async fn charge_reads(&self, _now_millis: i64, _reads: i64) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
     }
 
     struct MockProvider;
