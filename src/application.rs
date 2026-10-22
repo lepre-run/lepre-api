@@ -27,6 +27,11 @@ const MAX_FAILED_TURN_BACKOFF_MILLIS: i64 = 6 * 60 * 60 * 1_000;
 /// cursor past `now - EVENT_VISIBILITY_GRACE_MILLIS`, so a late row is still
 /// read on a later turn.
 const EVENT_VISIBILITY_GRACE_MILLIS: i64 = 10_000;
+/// An HTTP request refreshes a token expiring within this many seconds.
+const REQUEST_TOKEN_MARGIN_SECONDS: i64 = 60;
+/// An import turn refreshes a token expiring within this many seconds, so it
+/// cannot run out while the turn's Strava calls are still in flight.
+const IMPORT_TOKEN_MARGIN_SECONDS: i64 = 10 * 60;
 pub const SYNC_BATCH_REQUEST_COST: i64 = 21;
 /// Strava reads of one history page: the list plus up to 10 details.
 const HISTORY_PAGE_REQUEST_COST: i64 = 11;
@@ -522,7 +527,9 @@ impl Application {
             }
         }
         let connection = self.connection(&user_id).await?;
-        let access_token = self.valid_access_token(connection, now_seconds).await?;
+        let access_token = self
+            .valid_access_token(connection, now_seconds, REQUEST_TOKEN_MARGIN_SECONDS)
+            .await?;
         let before = request.snapshot_millis / 1000 + 1;
         let (mut workouts, event_offset) = match request.phase.clone() {
             SyncPhase::Activities { page } => {
@@ -614,7 +621,10 @@ impl Application {
             return Ok(());
         };
         let connection = self.connection(&user_id).await?;
-        if let Ok(access) = self.valid_access_token(connection, now_seconds).await {
+        if let Ok(access) = self
+            .valid_access_token(connection, now_seconds, REQUEST_TOKEN_MARGIN_SECONDS)
+            .await
+        {
             let _ = self.provider.deauthorize(&access).await;
         }
         self.repository
@@ -688,12 +698,23 @@ impl Application {
         now_millis: i64,
         max_turns: usize,
     ) -> Result<ImportTickReport, ApplicationError> {
+        self.import_tick_with_clock(&|| now_millis, max_turns).await
+    }
+
+    /// `import_tick` reading `clock` (epoch milliseconds) once per turn, so a
+    /// long tick neither checks tokens nor stamps turns with a stale time.
+    pub async fn import_tick_with_clock(
+        &self,
+        clock: &(dyn Fn() -> i64 + Send + Sync),
+        max_turns: usize,
+    ) -> Result<ImportTickReport, ApplicationError> {
+        let tick_started_millis = clock();
         let mut pending = self
             .history
             .pending_imports()
             .await
             .map_err(ApplicationError::Persistence)?;
-        pending.retain(|entry| entry.retry_at_millis <= now_millis);
+        pending.retain(|entry| entry.retry_at_millis <= tick_started_millis);
         pending.sort_by_key(|entry| (entry.last_turn_millis, entry.touched_at_millis));
         let mut report = ImportTickReport::default();
         while !pending.is_empty() {
@@ -702,6 +723,7 @@ impl Application {
                 if report.turns >= max_turns {
                     return Ok(report);
                 }
+                let now_millis = clock();
                 // Settle the token before reserving quota: a refresh does not
                 // use the read budget, so a dead token never reserves reads.
                 let access_token = match self.turn_access_token(&entry.user_id, now_millis).await {
@@ -805,7 +827,7 @@ impl Application {
         else {
             return Ok(None);
         };
-        self.valid_access_token(connection, now_millis / 1_000)
+        self.valid_access_token(connection, now_millis / 1_000, IMPORT_TOKEN_MARGIN_SECONDS)
             .await
             .map(Some)
     }
@@ -1134,9 +1156,10 @@ impl Application {
         &self,
         mut connection: StoredProviderConnection,
         now_seconds: i64,
+        margin_seconds: i64,
     ) -> Result<String, ApplicationError> {
         for _ in 0..2 {
-            if connection.credentials.expires_at > now_seconds + 60 {
+            if connection.credentials.expires_at > now_seconds.saturating_add(margin_seconds) {
                 return Ok(connection.credentials.access_token);
             }
             let refreshed = self
@@ -2296,6 +2319,40 @@ mod tests {
             WORKOUT_REQUEST_COST
         );
         assert!(!history.is_pending("u1"));
+    }
+
+    #[tokio::test]
+    async fn each_turn_reads_the_clock_and_refreshes_tokens_close_to_expiry() {
+        let mut soon_expiring = connection("u1", "42");
+        soon_expiring.credentials.expires_at = NOW_MILLIS / 1_000 + 700;
+        let repository = Arc::new(FakeRepository::new(vec![soon_expiring], 10));
+        let history = Arc::new(FakeHistory::with_pending(&[("u1", 0)]));
+        let provider = Arc::new(FakeProvider::with_pages(vec![history_page(
+            vec![workout(1, "2026-07-14T06:00:00Z")],
+            1_784_008_800,
+        )]));
+        // 200 s pass between the two turns.
+        let reads = std::sync::atomic::AtomicI64::new(0);
+        let clock = || {
+            let read = reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if read < 2 {
+                NOW_MILLIS
+            } else {
+                NOW_MILLIS + 200_000
+            }
+        };
+
+        let report = application(&repository, &history, &provider)
+            .import_tick_with_clock(&clock, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(report.turns, 2);
+        assert_eq!(report.completed, 1);
+        // 700 s left at the first turn: no refresh. 500 s left at the second,
+        // under the 10-minute margin: refreshed before calling Strava.
+        assert_eq!(*provider.refresh_requests.lock().unwrap(), 1);
+        assert_eq!(*provider.used_tokens.lock().unwrap(), ["access", "fresh"]);
     }
 
     #[tokio::test]
