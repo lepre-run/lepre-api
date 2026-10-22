@@ -9,5 +9,6 @@ pub mod db;
 pub mod domain;
 pub mod handler;
 pub mod headers;
+pub mod history;
 pub mod redirect;
 pub mod strava;

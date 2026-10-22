@@ -10,12 +10,13 @@ use reqwest::header::RETRY_AFTER;
 use serde::{Deserialize, Serialize};
 
 use crate::application::{
-    AuthorizedProviderAccount, Provider, ProviderCredentials, ProviderRateLimited,
-    ProviderWorkoutPage,
+    AuthorizedProviderAccount, Provider, ProviderAuthRevoked, ProviderCredentials,
+    ProviderHistoryPage, ProviderRateLimited, ProviderWorkoutPage,
 };
 use crate::domain::{
     DomainError, ExternalAccountId, Lap, RunSport, Workout, WorkoutData, WorkoutId, WorkoutType,
 };
+use crate::history::utc_seconds;
 
 const AUTHORIZE_URL: &str = "https://www.strava.com/oauth/authorize";
 const TOKEN_URL: &str = "https://www.strava.com/oauth/token";
@@ -147,6 +148,8 @@ struct AthleteDto {
 struct SummaryActivityDto {
     id: i64,
     sport_type: String,
+    #[serde(default)]
+    start_date: String,
 }
 
 #[derive(Deserialize)]
@@ -359,21 +362,29 @@ impl Provider for StravaProvider {
 
     async fn refresh(&self, refresh_token: &str) -> Result<ProviderCredentials, anyhow::Error> {
         let started = Instant::now();
-        let response: RefreshedTokenDto = checked_json(
-            self.client
-                .post(&self.endpoints.token)
-                .form(&RefreshRequest {
-                    client_id: &self.client_id,
-                    client_secret: &self.client_secret,
-                    refresh_token,
-                    grant_type: "refresh_token",
-                })
-                .send()
-                .await?,
-            "refresh_token",
-            started,
-        )
-        .await?;
+        let response = self
+            .client
+            .post(&self.endpoints.token)
+            .form(&RefreshRequest {
+                client_id: &self.client_id,
+                client_secret: &self.client_secret,
+                refresh_token,
+                grant_type: "refresh_token",
+            })
+            .send()
+            .await?;
+        record_response(&response, "refresh_token", started);
+        if response.status() == reqwest::StatusCode::BAD_REQUEST {
+            let body = response.text().await.unwrap_or_default();
+            if refresh_token_rejected(&body) {
+                return Err(ProviderAuthRevoked.into());
+            }
+            anyhow::bail!(
+                "Strava returned {}: {body}",
+                reqwest::StatusCode::BAD_REQUEST
+            )
+        }
+        let response: RefreshedTokenDto = checked_json_body(response).await?;
         Ok(ProviderCredentials {
             access_token: response.access_token,
             refresh_token: response.refresh_token,
@@ -406,19 +417,68 @@ impl Provider for StravaProvider {
         )
         .await?;
         let has_more = activities.len() == ACTIVITY_PAGE_SIZE as usize;
-        let ids = activities
-            .into_iter()
-            .filter(|activity| run_sport(&activity.sport_type).is_some())
-            .map(|activity| activity.id);
-        let workouts = stream::iter(ids)
-            .map(|id| async move { self.detailed_workout(access_token, id).await })
-            .buffered(DETAIL_CONCURRENCY)
-            .try_collect::<Vec<Option<Workout>>>()
-            .await?
-            .into_iter()
-            .flatten()
-            .collect();
+        let workouts = self.detailed_runs(access_token, activities).await?;
         Ok(ProviderWorkoutPage { workouts, has_more })
+    }
+
+    async fn history_page(
+        &self,
+        access_token: &str,
+        before_seconds: i64,
+        skip_ids: &[i64],
+    ) -> Result<ProviderHistoryPage, anyhow::Error> {
+        let started = Instant::now();
+        // Without `after`, Strava lists the newest activities first.
+        let activities: Vec<SummaryActivityDto> = checked_json(
+            self.client
+                .get(&self.endpoints.activities)
+                .bearer_auth(access_token)
+                .query(&[("before", before_seconds), ("per_page", ACTIVITY_PAGE_SIZE)])
+                .send()
+                .await?,
+            "list_activities",
+            started,
+        )
+        .await?;
+        let starts: Vec<(i64, i64)> = activities
+            .iter()
+            .filter_map(|activity| {
+                let start = utc_seconds(&activity.start_date);
+                if start.is_none() {
+                    tracing::warn!(
+                        event = "strava_activity_without_start",
+                        activity_id = activity.id,
+                        "listed Strava activity has no usable start_date"
+                    );
+                }
+                start.map(|start| (activity.id, start))
+            })
+            .collect();
+        if starts.is_empty() && !activities.is_empty() {
+            anyhow::bail!("no listed Strava activity has a usable start_date");
+        }
+        let oldest_start_seconds = starts.iter().map(|(_, start)| *start).min();
+        let oldest_ids = starts
+            .iter()
+            .filter(|(_, start)| Some(*start) == oldest_start_seconds)
+            .map(|(id, _)| *id)
+            .collect();
+        let full = activities.len() == ACTIVITY_PAGE_SIZE as usize;
+        // Activities already imported from the re-listed boundary second
+        // cost no detail request.
+        let fresh: Vec<SummaryActivityDto> = activities
+            .into_iter()
+            .filter(|activity| !skip_ids.contains(&activity.id))
+            .collect();
+        let new_activities = fresh.len();
+        let workouts = self.detailed_runs(access_token, fresh).await?;
+        Ok(ProviderHistoryPage {
+            workouts,
+            oldest_start_seconds,
+            oldest_ids,
+            new_activities,
+            full,
+        })
     }
 
     async fn workout(
@@ -447,6 +507,26 @@ impl Provider for StravaProvider {
 }
 
 impl StravaProvider {
+    /// Fetch details for the running activities of a list page.
+    async fn detailed_runs(
+        &self,
+        access_token: &str,
+        activities: Vec<SummaryActivityDto>,
+    ) -> Result<Vec<Workout>, anyhow::Error> {
+        let ids = activities
+            .into_iter()
+            .filter(|activity| run_sport(&activity.sport_type).is_some())
+            .map(|activity| activity.id);
+        Ok(stream::iter(ids)
+            .map(|id| async move { self.detailed_workout(access_token, id).await })
+            .buffered(DETAIL_CONCURRENCY)
+            .try_collect::<Vec<Option<Workout>>>()
+            .await?
+            .into_iter()
+            .flatten()
+            .collect())
+    }
+
     async fn detailed_workout(
         &self,
         access_token: &str,
@@ -495,10 +575,31 @@ async fn checked_json_body<Value: for<'de> Deserialize<'de>>(
             }
             .into());
         }
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(ProviderAuthRevoked.into());
+        }
         let body = response.text().await.unwrap_or_default();
         anyhow::bail!("Strava returned {status}: {body}")
     }
     response.json().await.context("invalid Strava response")
+}
+
+/// Whether a 400 from the token endpoint means the refresh token itself was
+/// refused: OAuth's `invalid_grant`, or Strava's
+/// `{"resource":"RefreshToken","code":"invalid"}` error.
+fn refresh_token_rejected(body: &str) -> bool {
+    if body.contains("invalid_grant") {
+        return true;
+    }
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("errors")?.as_array().cloned())
+        .is_some_and(|errors| {
+            errors.iter().any(|error| {
+                error.get("resource").and_then(|value| value.as_str()) == Some("RefreshToken")
+                    && error.get("code").and_then(|value| value.as_str()) == Some("invalid")
+            })
+        })
 }
 
 fn record_response(response: &reqwest::Response, endpoint: &'static str, started: Instant) {
@@ -837,6 +938,213 @@ mod tests {
             .await
             .unwrap();
         assert!(page.workouts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn history_page_lists_newest_first_before_the_cursor() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/activities"))
+            .and(query_param("before", "1800000000"))
+            .and(query_param("per_page", "10"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id":7, "sport_type":"Run", "start_date":"2026-07-15T06:00:00Z"},
+                {"id":8, "sport_type":"Ride", "start_date":"2026-07-14T06:00:00Z"}
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/activity/7"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id":7, "name":"Morning Run", "sport_type":"Run",
+                "start_date":"2026-07-15T06:00:00Z", "moving_time":3600,
+                "elapsed_time":3700, "distance":10050.5
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let page = StravaProvider::with_base_url(&server.uri())
+            .history_page("token", 1_800_000_000, &[])
+            .await
+            .unwrap();
+
+        assert_eq!(page.workouts.len(), 1);
+        assert_eq!(page.workouts[0].id.as_str(), "strava:7");
+        // The cursor moves past the ride too, not only past runs.
+        assert_eq!(page.oldest_start_seconds, Some(1_784_008_800));
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests[0].url.query_pairs().all(|(key, _)| key != "after"));
+    }
+
+    #[tokio::test]
+    async fn empty_history_page_ends_the_walk() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/activities"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+
+        let page = StravaProvider::with_base_url(&server.uri())
+            .history_page("token", 1_800_000_000, &[])
+            .await
+            .unwrap();
+
+        assert!(page.workouts.is_empty());
+        assert_eq!(page.oldest_start_seconds, None);
+    }
+
+    #[tokio::test]
+    async fn unauthorized_api_call_reports_revoked_authorization() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/activities"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "message":"Authorization Error",
+                "errors":[{"resource":"Athlete","field":"access_token","code":"invalid"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let error = StravaProvider::with_base_url(&server.uri())
+            .history_page("token", 1_800_000_000, &[])
+            .await
+            .unwrap_err();
+
+        assert!(error.downcast_ref::<ProviderAuthRevoked>().is_some());
+    }
+
+    #[tokio::test]
+    async fn refused_refresh_token_reports_revoked_authorization() {
+        for body in [
+            serde_json::json!({"error":"invalid_grant"}),
+            serde_json::json!({
+                "message":"Bad Request",
+                "errors":[{"resource":"RefreshToken","field":"refresh_token","code":"invalid"}]
+            }),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .and(body_string_contains("grant_type=refresh_token"))
+                .respond_with(ResponseTemplate::new(400).set_body_json(body))
+                .mount(&server)
+                .await;
+
+            let error = StravaProvider::with_base_url(&server.uri())
+                .refresh("refresh")
+                .await
+                .unwrap_err();
+
+            assert!(error.downcast_ref::<ProviderAuthRevoked>().is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn other_refresh_failures_are_not_revocations() {
+        for (status, body) in [
+            (
+                400,
+                serde_json::json!({
+                    "message":"Bad Request",
+                    "errors":[{"resource":"Application","field":"client_id","code":"invalid"}]
+                }),
+            ),
+            (500, serde_json::json!({"message":"error"})),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(body))
+                .mount(&server)
+                .await;
+
+            let error = StravaProvider::with_base_url(&server.uri())
+                .refresh("refresh")
+                .await
+                .unwrap_err();
+
+            assert!(error.downcast_ref::<ProviderAuthRevoked>().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn history_page_skips_details_for_already_imported_boundary_activities() {
+        let server = MockServer::start().await;
+        // Re-listing the boundary second (before = tie + 1) returns run 10
+        // again, next to its same-second sibling 11 and an older run 12.
+        Mock::given(method("GET"))
+            .and(path("/activities"))
+            .and(query_param("before", "1784008801"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id":10, "sport_type":"Run", "start_date":"2026-07-14T06:00:00Z"},
+                {"id":11, "sport_type":"Run", "start_date":"2026-07-14T06:00:00Z"},
+                {"id":12, "sport_type":"Run", "start_date":"2026-07-13T06:00:00Z"}
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/activity/10"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        for (id, start) in [(11, "2026-07-14T06:00:00Z"), (12, "2026-07-13T06:00:00Z")] {
+            Mock::given(method("GET"))
+                .and(path(format!("/activity/{id}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id":id, "name":"Run", "sport_type":"Run", "start_date":start,
+                    "moving_time":1800, "elapsed_time":1800, "distance":5000.0
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let page = StravaProvider::with_base_url(&server.uri())
+            .history_page("token", 1_784_008_801, &[10])
+            .await
+            .unwrap();
+
+        let ids: Vec<_> = page.workouts.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["strava:11", "strava:12"]);
+        assert_eq!(page.new_activities, 2);
+        assert!(!page.full);
+        assert_eq!(page.oldest_start_seconds, Some(1_783_922_400));
+        assert_eq!(page.oldest_ids, [12]);
+    }
+
+    #[tokio::test]
+    async fn history_page_reports_every_activity_at_the_oldest_second() {
+        let server = MockServer::start().await;
+        let listed: Vec<_> = (1..=10)
+            .map(|id| {
+                let start = if id >= 9 {
+                    "2026-07-14T06:00:00Z"
+                } else {
+                    "2026-07-15T06:00:00Z"
+                };
+                serde_json::json!({"id":id, "sport_type":"Ride", "start_date":start})
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/activities"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(listed))
+            .mount(&server)
+            .await;
+
+        let page = StravaProvider::with_base_url(&server.uri())
+            .history_page("token", 1_800_000_000, &[])
+            .await
+            .unwrap();
+
+        assert!(page.full);
+        assert_eq!(page.new_activities, 10);
+        assert_eq!(page.oldest_start_seconds, Some(1_784_008_800));
+        assert_eq!(page.oldest_ids, [9, 10]);
     }
 
     #[tokio::test]
