@@ -830,7 +830,8 @@ impl HistoryRepository for Store {
             .update_expression(
                 "SET user_id = :user_id, touched_at_millis = :now, \
                  last_turn_millis = if_not_exists(last_turn_millis, :zero), \
-                 retry_at_millis = if_not_exists(retry_at_millis, :zero)",
+                 retry_at_millis = if_not_exists(retry_at_millis, :zero), \
+                 failures = if_not_exists(failures, :zero)",
             )
             .expression_attribute_values(":user_id", AttributeValue::S(user_id.to_string()))
             .expression_attribute_values(":now", AttributeValue::N(now_millis.to_string()))
@@ -865,6 +866,7 @@ impl HistoryRepository for Store {
                     touched_at_millis: n(item, "touched_at_millis")?,
                     last_turn_millis: n(item, "last_turn_millis")?,
                     retry_at_millis: n(item, "retry_at_millis")?,
+                    failures: optional_n(item, "failures")?.unwrap_or(0),
                 });
             }
             match response.last_evaluated_key {
@@ -879,6 +881,7 @@ impl HistoryRepository for Store {
         user_id: &UserId,
         now_millis: i64,
         retry_at_millis: i64,
+        failures: i64,
     ) -> Result<(), anyhow::Error> {
         let result = self
             .client
@@ -886,10 +889,13 @@ impl HistoryRepository for Store {
             .table_name(&self.table)
             .key(PK, AttributeValue::S(HISTORY_PENDING_PK.to_owned()))
             .key(SK, AttributeValue::S(user_pk(user_id)))
-            .update_expression("SET last_turn_millis = :now, retry_at_millis = :retry")
+            .update_expression(
+                "SET last_turn_millis = :now, retry_at_millis = :retry, failures = :failures",
+            )
             .condition_expression("attribute_exists(pk)")
             .expression_attribute_values(":now", AttributeValue::N(now_millis.to_string()))
             .expression_attribute_values(":retry", AttributeValue::N(retry_at_millis.to_string()))
+            .expression_attribute_values(":failures", AttributeValue::N(failures.to_string()))
             .send()
             .await;
         match result {
@@ -951,6 +957,7 @@ impl HistoryRepository for Store {
                     status: match s(item, "import_status")? {
                         "in_progress" => ImportStatus::InProgress,
                         "complete" => ImportStatus::Complete,
+                        "failed" => ImportStatus::Failed,
                         other => return Err(anyhow!("unknown history import status {other}")),
                     },
                     before_seconds: n(item, "before_seconds")?,
@@ -970,6 +977,7 @@ impl HistoryRepository for Store {
         let status = match state.status {
             ImportStatus::InProgress => "in_progress",
             ImportStatus::Complete => "complete",
+            ImportStatus::Failed => "failed",
         };
         self.client
             .put_item()
@@ -1343,6 +1351,13 @@ fn n(item: &HashMap<String, AttributeValue>, key: &str) -> Result<i64, anyhow::E
         .with_context(|| format!("invalid numeric field {key}"))
 }
 
+fn optional_n(
+    item: &HashMap<String, AttributeValue>,
+    key: &str,
+) -> Result<Option<i64>, anyhow::Error> {
+    item.get(key).map(|_| n(item, key)).transpose()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1555,6 +1570,7 @@ mod tests {
                 touched_at_millis: 5,
                 last_turn_millis: 0,
                 retry_at_millis: 0,
+                failures: 0,
             })
             .await
             .unwrap();

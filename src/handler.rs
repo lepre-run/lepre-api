@@ -1273,6 +1273,7 @@ mod tests {
             _user_id: &UserId,
             _now_millis: i64,
             _retry_at_millis: i64,
+            _failures: i64,
         ) -> Result<(), anyhow::Error> {
             unimplemented!("record_turn unused in webhook tests")
         }

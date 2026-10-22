@@ -16,9 +16,11 @@ use crate::domain::{
 const SESSION_SECONDS: i64 = 30 * 24 * 60 * 60;
 const MAX_SYNC_PAGES: i64 = 1_000;
 const MAX_SYNC_EVENT_BATCH: usize = 10;
-/// Wait after a failed import turn so one broken account cannot spend the
-/// shared Strava budget every minute.
+/// Wait after the first failed import turn so one broken account cannot
+/// spend the shared Strava budget every minute. Doubles with every further
+/// consecutive failure, up to `MAX_FAILED_TURN_BACKOFF_MILLIS`.
 const FAILED_TURN_BACKOFF_MILLIS: i64 = 15 * 60 * 1_000;
+const MAX_FAILED_TURN_BACKOFF_MILLIS: i64 = 6 * 60 * 60 * 1_000;
 pub const SYNC_BATCH_REQUEST_COST: i64 = 21;
 
 #[derive(Debug, Clone)]
@@ -72,6 +74,10 @@ pub struct ProviderEvent {
 pub enum ImportStatus {
     InProgress,
     Complete,
+    /// Stopped for good: Strava rejected the user's authorization. The user
+    /// leaves the pending list and resumes only when something marks them
+    /// pending again (a reconnect or a webhook).
+    Failed,
 }
 
 /// Progress of one user's Strava → DynamoDB import.
@@ -107,6 +113,8 @@ pub struct PendingImport {
     pub last_turn_millis: i64,
     /// No turn is taken for this user before this time.
     pub retry_at_millis: i64,
+    /// Consecutive failed turns; drives the exponential backoff.
+    pub failures: i64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -277,6 +285,7 @@ pub trait HistoryRepository: Send + Sync {
         user_id: &UserId,
         now_millis: i64,
         retry_at_millis: i64,
+        failures: i64,
     ) -> Result<(), anyhow::Error>;
     /// Remove the entry unless it was touched after `pending` was read.
     async fn clear_pending(&self, pending: &PendingImport) -> Result<(), anyhow::Error>;
@@ -299,6 +308,13 @@ pub trait HistoryRepository: Send + Sync {
 pub struct ProviderRateLimited {
     pub retry_after_seconds: u64,
 }
+
+/// Strava rejected the user's authorization: an API call returned 401 or the
+/// refresh token was refused (`invalid_grant`). Retrying cannot succeed until
+/// the user reconnects.
+#[derive(Debug, Error)]
+#[error("provider authorization was revoked or is invalid")]
+pub struct ProviderAuthRevoked;
 
 #[derive(Debug, Error)]
 pub enum ApplicationError {
@@ -329,7 +345,6 @@ pub struct Application {
 enum TurnOutcome {
     Finished,
     MoreWork,
-    Disconnected,
 }
 
 impl Application {
@@ -633,10 +648,31 @@ impl Application {
         let mut report = ImportTickReport::default();
         while !pending.is_empty() {
             let mut next_round = Vec::new();
-            for entry in pending {
+            for mut entry in pending {
                 if report.turns >= max_turns {
                     return Ok(report);
                 }
+                // Settle the token before reserving quota: a refresh does not
+                // use the read budget, so a dead token never reserves reads.
+                let access_token = match self.turn_access_token(&entry.user_id, now_millis).await {
+                    Ok(Some(access_token)) => access_token,
+                    Ok(None) => {
+                        self.history
+                            .clear_pending(&entry)
+                            .await
+                            .map_err(ApplicationError::Persistence)?;
+                        continue;
+                    }
+                    Err(error) => {
+                        if self
+                            .turn_failed(&entry, error, now_millis, &mut report)
+                            .await?
+                        {
+                            return Ok(report);
+                        }
+                        continue;
+                    }
+                };
                 let turn = self
                     .repository
                     .acquire_sync_turn(&entry.user_id, now_millis, &self.sync_gate)
@@ -647,7 +683,10 @@ impl Application {
                     return Ok(report);
                 }
                 report.turns += 1;
-                match self.import_turn(&entry.user_id, now_millis).await {
+                match self
+                    .import_turn(&entry.user_id, &access_token, now_millis)
+                    .await
+                {
                     Ok(TurnOutcome::Finished) => {
                         report.completed += 1;
                         self.history
@@ -655,37 +694,21 @@ impl Application {
                             .await
                             .map_err(ApplicationError::Persistence)?;
                     }
-                    Ok(TurnOutcome::Disconnected) => self
-                        .history
-                        .clear_pending(&entry)
-                        .await
-                        .map_err(ApplicationError::Persistence)?,
                     Ok(TurnOutcome::MoreWork) => {
                         self.history
-                            .record_turn(&entry.user_id, now_millis, now_millis)
+                            .record_turn(&entry.user_id, now_millis, now_millis, 0)
                             .await
                             .map_err(ApplicationError::Persistence)?;
+                        entry.failures = 0;
                         next_round.push(entry);
                     }
-                    Err(ApplicationError::ProviderRateLimited { .. }) => {
-                        report.stopped_by_quota = true;
-                        return Ok(report);
-                    }
                     Err(error) => {
-                        tracing::warn!(
-                            event = "history_import_turn_failed",
-                            error = %error,
-                            "history import turn failed; retrying on a later tick"
-                        );
-                        report.failed += 1;
-                        self.history
-                            .record_turn(
-                                &entry.user_id,
-                                now_millis,
-                                now_millis + FAILED_TURN_BACKOFF_MILLIS,
-                            )
-                            .await
-                            .map_err(ApplicationError::Persistence)?;
+                        if self
+                            .turn_failed(&entry, error, now_millis, &mut report)
+                            .await?
+                        {
+                            return Ok(report);
+                        }
                     }
                 }
             }
@@ -694,24 +717,93 @@ impl Application {
         Ok(report)
     }
 
-    /// One quota turn for one user: pending webhook events first, then the
-    /// next page of history.
-    async fn import_turn(
+    /// A valid access token for the user's next turn, refreshed if needed, or
+    /// `None` when the user is no longer connected.
+    async fn turn_access_token(
         &self,
         user_id: &UserId,
         now_millis: i64,
-    ) -> Result<TurnOutcome, ApplicationError> {
+    ) -> Result<Option<String>, ApplicationError> {
         let Some(connection) = self
             .repository
             .connection_for_user(user_id)
             .await
             .map_err(ApplicationError::Persistence)?
         else {
-            return Ok(TurnOutcome::Disconnected);
+            return Ok(None);
         };
-        let access_token = self
-            .valid_access_token(connection, now_millis / 1_000)
-            .await?;
+        self.valid_access_token(connection, now_millis / 1_000)
+            .await
+            .map(Some)
+    }
+
+    /// Book a failed turn. Returns `true` when the whole tick must stop.
+    ///
+    /// A revoked authorization is terminal: the import is marked `Failed` and
+    /// the user leaves the pending list, so no more quota is spent on them.
+    /// Any other error retries later with a capped exponential backoff.
+    async fn turn_failed(
+        &self,
+        entry: &PendingImport,
+        error: ApplicationError,
+        now_millis: i64,
+        report: &mut ImportTickReport,
+    ) -> Result<bool, ApplicationError> {
+        if let ApplicationError::ProviderRateLimited { .. } = error {
+            report.stopped_by_quota = true;
+            return Ok(true);
+        }
+        report.failed += 1;
+        if is_authorization_revoked(&error) {
+            tracing::warn!(
+                event = "history_import_authorization_revoked",
+                error = %error,
+                "Strava rejected the user's authorization; marking the import failed"
+            );
+            let mut state = self
+                .history
+                .import_state(&entry.user_id)
+                .await
+                .map_err(ApplicationError::Persistence)?
+                .unwrap_or_else(|| ImportState::started(now_millis));
+            state.status = ImportStatus::Failed;
+            self.history
+                .save_import_state(&entry.user_id, &state)
+                .await
+                .map_err(ApplicationError::Persistence)?;
+            self.history
+                .clear_pending(entry)
+                .await
+                .map_err(ApplicationError::Persistence)?;
+            return Ok(false);
+        }
+        let failures = entry.failures.saturating_add(1);
+        tracing::warn!(
+            event = "history_import_turn_failed",
+            error = %error,
+            failures,
+            "history import turn failed; retrying on a later tick"
+        );
+        self.history
+            .record_turn(
+                &entry.user_id,
+                now_millis,
+                now_millis + failed_turn_backoff_millis(failures),
+                failures,
+            )
+            .await
+            .map_err(ApplicationError::Persistence)?;
+        Ok(false)
+    }
+
+    /// One quota turn for one user: pending webhook events first, then the
+    /// next page of history.
+    async fn import_turn(
+        &self,
+        user_id: &UserId,
+        access_token: &str,
+        now_millis: i64,
+    ) -> Result<TurnOutcome, ApplicationError> {
         let mut state = self
             .history
             .import_state(user_id)
@@ -738,7 +830,7 @@ impl Application {
             }
             match self
                 .provider
-                .workout(&access_token, event.external_workout_id)
+                .workout(access_token, event.external_workout_id)
                 .await
                 .map_err(provider_error)?
             {
@@ -751,10 +843,12 @@ impl Application {
             .await
             .map_err(ApplicationError::Persistence)?;
 
-        if state.status == ImportStatus::InProgress {
+        if state.status != ImportStatus::Complete {
+            // A failed import resumes once the user is marked pending again.
+            state.status = ImportStatus::InProgress;
             let page = self
                 .provider
-                .history_page(&access_token, state.before_seconds)
+                .history_page(access_token, state.before_seconds)
                 .await
                 .map_err(provider_error)?;
             match page.oldest_start_seconds {
@@ -889,6 +983,22 @@ fn event_batch(events: Vec<ProviderEvent>, max_workouts: usize) -> (Vec<Provider
     let more = taken < events.len();
     events.truncate(taken);
     (events, more)
+}
+
+/// Backoff after the `failures`-th consecutive failed turn: 15 min, 30 min,
+/// 1 h, … capped at 6 h.
+fn failed_turn_backoff_millis(failures: i64) -> i64 {
+    let doublings = failures.saturating_sub(1).clamp(0, 16) as u32;
+    FAILED_TURN_BACKOFF_MILLIS
+        .saturating_mul(1_i64 << doublings)
+        .min(MAX_FAILED_TURN_BACKOFF_MILLIS)
+}
+
+fn is_authorization_revoked(error: &ApplicationError) -> bool {
+    matches!(
+        error,
+        ApplicationError::Provider(source) if source.downcast_ref::<ProviderAuthRevoked>().is_some()
+    )
 }
 
 fn provider_error(error: anyhow::Error) -> ApplicationError {
@@ -1125,6 +1235,7 @@ mod tests {
                         touched_at_millis: 1,
                         last_turn_millis: *last_turn_millis,
                         retry_at_millis: 0,
+                        failures: 0,
                     },
                 );
             }
@@ -1154,9 +1265,13 @@ mod tests {
             now_millis: i64,
         ) -> Result<(), anyhow::Error> {
             let mut pending = self.pending.lock().unwrap();
-            let (last_turn_millis, retry_at_millis) =
-                pending.get(user_id.as_str()).map_or((0, 0), |entry| {
-                    (entry.last_turn_millis, entry.retry_at_millis)
+            let (last_turn_millis, retry_at_millis, failures) =
+                pending.get(user_id.as_str()).map_or((0, 0, 0), |entry| {
+                    (
+                        entry.last_turn_millis,
+                        entry.retry_at_millis,
+                        entry.failures,
+                    )
                 });
             pending.insert(
                 user_id.to_string(),
@@ -1165,6 +1280,7 @@ mod tests {
                     touched_at_millis: now_millis,
                     last_turn_millis,
                     retry_at_millis,
+                    failures,
                 },
             );
             Ok(())
@@ -1179,10 +1295,12 @@ mod tests {
             user_id: &UserId,
             now_millis: i64,
             retry_at_millis: i64,
+            failures: i64,
         ) -> Result<(), anyhow::Error> {
             if let Some(entry) = self.pending.lock().unwrap().get_mut(user_id.as_str()) {
                 entry.last_turn_millis = now_millis;
                 entry.retry_at_millis = retry_at_millis;
+                entry.failures = failures;
             }
             Ok(())
         }
@@ -1280,6 +1398,8 @@ mod tests {
         details: HashMap<i64, Workout>,
         page_cursors: Mutex<Vec<i64>>,
         detail_requests: Mutex<Vec<i64>>,
+        refresh_error: Mutex<Option<anyhow::Error>>,
+        refresh_requests: Mutex<usize>,
     }
 
     impl FakeProvider {
@@ -1309,7 +1429,11 @@ mod tests {
             &self,
             _refresh_token: &str,
         ) -> Result<ProviderCredentials, anyhow::Error> {
-            unimplemented!("refresh unused in import tests")
+            *self.refresh_requests.lock().unwrap() += 1;
+            match self.refresh_error.lock().unwrap().take() {
+                Some(error) => Err(error),
+                None => unimplemented!("successful refresh unused in import tests"),
+            }
         }
 
         async fn workouts(
@@ -1541,6 +1665,182 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(report.turns, 1);
+    }
+
+    #[test]
+    fn failure_backoff_doubles_up_to_six_hours() {
+        let minutes = |failures| failed_turn_backoff_millis(failures) / 60_000;
+        assert_eq!(minutes(1), 15);
+        assert_eq!(minutes(2), 30);
+        assert_eq!(minutes(3), 60);
+        assert_eq!(minutes(5), 240);
+        assert_eq!(minutes(6), 360);
+        assert_eq!(minutes(7), 360);
+        assert_eq!(minutes(i64::MAX), 360);
+    }
+
+    #[tokio::test]
+    async fn repeated_failures_back_off_exponentially() {
+        let repository = Arc::new(FakeRepository::new(vec![connection("u1", "42")], 100));
+        let history = Arc::new(FakeHistory::with_pending(&[("u1", 0)]));
+        let provider = Arc::new(FakeProvider {
+            pages: Mutex::new(
+                (0..8)
+                    .map(|_| Err(anyhow::anyhow!("Strava returned 503")))
+                    .collect(),
+            ),
+            ..FakeProvider::default()
+        });
+        let application = application(&repository, &history, &provider);
+
+        let mut now = NOW_MILLIS;
+        let mut waits = Vec::new();
+        for _ in 0..7 {
+            let report = application.import_tick(now, 10).await.unwrap();
+            assert_eq!(report.failed, 1);
+            let entry = history.pending.lock().unwrap()["u1"].clone();
+            waits.push((entry.retry_at_millis - now) / 60_000);
+            // One minute early: still backing off, no quota requested.
+            let before = repository.turn_requests.lock().unwrap().len();
+            application
+                .import_tick(entry.retry_at_millis - 60_000, 10)
+                .await
+                .unwrap();
+            assert_eq!(repository.turn_requests.lock().unwrap().len(), before);
+            now = entry.retry_at_millis;
+        }
+        assert_eq!(waits, [15, 30, 60, 120, 240, 360, 360]);
+        assert!(history.is_pending("u1"));
+    }
+
+    #[tokio::test]
+    async fn success_resets_the_failure_backoff() {
+        let repository = Arc::new(FakeRepository::new(vec![connection("u1", "42")], 10));
+        let history = Arc::new(FakeHistory::with_pending(&[("u1", 0)]));
+        history
+            .pending
+            .lock()
+            .unwrap()
+            .get_mut("u1")
+            .unwrap()
+            .failures = 4;
+        let provider = Arc::new(FakeProvider::with_pages(vec![ProviderHistoryPage {
+            workouts: vec![workout(1, "2026-10-01T06:00:00Z")],
+            oldest_start_seconds: Some(1_789_000_000),
+        }]));
+
+        application(&repository, &history, &provider)
+            .import_tick(NOW_MILLIS, 1)
+            .await
+            .unwrap();
+
+        let entry = history.pending.lock().unwrap()["u1"].clone();
+        assert_eq!(entry.failures, 0);
+        assert_eq!(entry.retry_at_millis, NOW_MILLIS);
+    }
+
+    #[tokio::test]
+    async fn revoked_access_token_fails_the_import_for_good() {
+        let repository = Arc::new(FakeRepository::new(vec![connection("u1", "42")], 10));
+        let history = Arc::new(FakeHistory::with_pending(&[("u1", 0)]));
+        let provider = Arc::new(FakeProvider {
+            pages: Mutex::new(VecDeque::from([Err(ProviderAuthRevoked.into())])),
+            ..FakeProvider::default()
+        });
+        let application = application(&repository, &history, &provider);
+
+        let report = application.import_tick(NOW_MILLIS, 10).await.unwrap();
+
+        assert_eq!(report.failed, 1);
+        assert_eq!(history.state("u1").unwrap().status, ImportStatus::Failed);
+        assert!(!history.is_pending("u1"));
+        // No retry: later ticks never reserve quota for this user again.
+        for later in [FAILED_TURN_BACKOFF_MILLIS, MAX_FAILED_TURN_BACKOFF_MILLIS] {
+            let report = application
+                .import_tick(NOW_MILLIS + later, 10)
+                .await
+                .unwrap();
+            assert_eq!(report.turns, 0);
+        }
+        assert_eq!(repository.turn_requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rejected_refresh_token_fails_before_reserving_quota() {
+        let mut expired = connection("u1", "42");
+        expired.credentials.expires_at = 0;
+        let repository = Arc::new(FakeRepository::new(vec![expired], 10));
+        let history = Arc::new(FakeHistory::with_pending(&[("u1", 0)]));
+        let provider = Arc::new(FakeProvider {
+            refresh_error: Mutex::new(Some(ProviderAuthRevoked.into())),
+            ..FakeProvider::default()
+        });
+
+        let report = application(&repository, &history, &provider)
+            .import_tick(NOW_MILLIS, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(*provider.refresh_requests.lock().unwrap(), 1);
+        assert!(repository.turn_requests.lock().unwrap().is_empty());
+        assert!(provider.page_cursors.lock().unwrap().is_empty());
+        assert_eq!(report.turns, 0);
+        assert_eq!(report.failed, 1);
+        assert_eq!(history.state("u1").unwrap().status, ImportStatus::Failed);
+        assert!(!history.is_pending("u1"));
+    }
+
+    #[tokio::test]
+    async fn transient_refresh_failure_backs_off_without_reserving_quota() {
+        let mut expired = connection("u1", "42");
+        expired.credentials.expires_at = 0;
+        let repository = Arc::new(FakeRepository::new(vec![expired], 10));
+        let history = Arc::new(FakeHistory::with_pending(&[("u1", 0)]));
+        let provider = Arc::new(FakeProvider {
+            refresh_error: Mutex::new(Some(anyhow::anyhow!("Strava returned 502"))),
+            ..FakeProvider::default()
+        });
+
+        let report = application(&repository, &history, &provider)
+            .import_tick(NOW_MILLIS, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(report.failed, 1);
+        assert!(repository.turn_requests.lock().unwrap().is_empty());
+        assert!(history.state("u1").is_none());
+        let entry = history.pending.lock().unwrap()["u1"].clone();
+        assert_eq!(entry.failures, 1);
+        assert_eq!(
+            entry.retry_at_millis,
+            NOW_MILLIS + FAILED_TURN_BACKOFF_MILLIS
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_import_resumes_when_marked_pending_again() {
+        let repository = Arc::new(FakeRepository::new(vec![connection("u1", "42")], 10));
+        let history = Arc::new(FakeHistory::default());
+        history.states.lock().unwrap().insert(
+            "u1".into(),
+            ImportState {
+                status: ImportStatus::Failed,
+                before_seconds: 1_789_000_000,
+                event_cursor_millis: 1_000,
+                imported_count: 4,
+                started_at_millis: 1_000,
+            },
+        );
+        history.mark_pending(&user("u1"), 2_000).await.unwrap();
+        let provider = Arc::new(FakeProvider::default());
+
+        application(&repository, &history, &provider)
+            .import_tick(NOW_MILLIS, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(*provider.page_cursors.lock().unwrap(), [1_789_000_000]);
+        assert_eq!(history.state("u1").unwrap().status, ImportStatus::Complete);
     }
 
     #[tokio::test]

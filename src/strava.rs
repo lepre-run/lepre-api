@@ -10,8 +10,8 @@ use reqwest::header::RETRY_AFTER;
 use serde::{Deserialize, Serialize};
 
 use crate::application::{
-    AuthorizedProviderAccount, Provider, ProviderCredentials, ProviderHistoryPage,
-    ProviderRateLimited, ProviderWorkoutPage,
+    AuthorizedProviderAccount, Provider, ProviderAuthRevoked, ProviderCredentials,
+    ProviderHistoryPage, ProviderRateLimited, ProviderWorkoutPage,
 };
 use crate::domain::{
     DomainError, ExternalAccountId, Lap, RunSport, Workout, WorkoutData, WorkoutId, WorkoutType,
@@ -362,21 +362,29 @@ impl Provider for StravaProvider {
 
     async fn refresh(&self, refresh_token: &str) -> Result<ProviderCredentials, anyhow::Error> {
         let started = Instant::now();
-        let response: RefreshedTokenDto = checked_json(
-            self.client
-                .post(&self.endpoints.token)
-                .form(&RefreshRequest {
-                    client_id: &self.client_id,
-                    client_secret: &self.client_secret,
-                    refresh_token,
-                    grant_type: "refresh_token",
-                })
-                .send()
-                .await?,
-            "refresh_token",
-            started,
-        )
-        .await?;
+        let response = self
+            .client
+            .post(&self.endpoints.token)
+            .form(&RefreshRequest {
+                client_id: &self.client_id,
+                client_secret: &self.client_secret,
+                refresh_token,
+                grant_type: "refresh_token",
+            })
+            .send()
+            .await?;
+        record_response(&response, "refresh_token", started);
+        if response.status() == reqwest::StatusCode::BAD_REQUEST {
+            let body = response.text().await.unwrap_or_default();
+            if refresh_token_rejected(&body) {
+                return Err(ProviderAuthRevoked.into());
+            }
+            anyhow::bail!(
+                "Strava returned {}: {body}",
+                reqwest::StatusCode::BAD_REQUEST
+            )
+        }
+        let response: RefreshedTokenDto = checked_json_body(response).await?;
         Ok(ProviderCredentials {
             access_token: response.access_token,
             refresh_token: response.refresh_token,
@@ -550,10 +558,31 @@ async fn checked_json_body<Value: for<'de> Deserialize<'de>>(
             }
             .into());
         }
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(ProviderAuthRevoked.into());
+        }
         let body = response.text().await.unwrap_or_default();
         anyhow::bail!("Strava returned {status}: {body}")
     }
     response.json().await.context("invalid Strava response")
+}
+
+/// Whether a 400 from the token endpoint means the refresh token itself was
+/// refused: OAuth's `invalid_grant`, or Strava's
+/// `{"resource":"RefreshToken","code":"invalid"}` error.
+fn refresh_token_rejected(body: &str) -> bool {
+    if body.contains("invalid_grant") {
+        return true;
+    }
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("errors")?.as_array().cloned())
+        .is_some_and(|errors| {
+            errors.iter().any(|error| {
+                error.get("resource").and_then(|value| value.as_str()) == Some("RefreshToken")
+                    && error.get("code").and_then(|value| value.as_str()) == Some("invalid")
+            })
+        })
 }
 
 fn record_response(response: &reqwest::Response, endpoint: &'static str, started: Instant) {
@@ -948,6 +977,80 @@ mod tests {
 
         assert!(page.workouts.is_empty());
         assert_eq!(page.oldest_start_seconds, None);
+    }
+
+    #[tokio::test]
+    async fn unauthorized_api_call_reports_revoked_authorization() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/activities"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "message":"Authorization Error",
+                "errors":[{"resource":"Athlete","field":"access_token","code":"invalid"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let error = StravaProvider::with_base_url(&server.uri())
+            .history_page("token", 1_800_000_000)
+            .await
+            .unwrap_err();
+
+        assert!(error.downcast_ref::<ProviderAuthRevoked>().is_some());
+    }
+
+    #[tokio::test]
+    async fn refused_refresh_token_reports_revoked_authorization() {
+        for body in [
+            serde_json::json!({"error":"invalid_grant"}),
+            serde_json::json!({
+                "message":"Bad Request",
+                "errors":[{"resource":"RefreshToken","field":"refresh_token","code":"invalid"}]
+            }),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .and(body_string_contains("grant_type=refresh_token"))
+                .respond_with(ResponseTemplate::new(400).set_body_json(body))
+                .mount(&server)
+                .await;
+
+            let error = StravaProvider::with_base_url(&server.uri())
+                .refresh("refresh")
+                .await
+                .unwrap_err();
+
+            assert!(error.downcast_ref::<ProviderAuthRevoked>().is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn other_refresh_failures_are_not_revocations() {
+        for (status, body) in [
+            (
+                400,
+                serde_json::json!({
+                    "message":"Bad Request",
+                    "errors":[{"resource":"Application","field":"client_id","code":"invalid"}]
+                }),
+            ),
+            (500, serde_json::json!({"message":"error"})),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(body))
+                .mount(&server)
+                .await;
+
+            let error = StravaProvider::with_base_url(&server.uri())
+                .refresh("refresh")
+                .await
+                .unwrap_err();
+
+            assert!(error.downcast_ref::<ProviderAuthRevoked>().is_none());
+        }
     }
 
     #[tokio::test]
